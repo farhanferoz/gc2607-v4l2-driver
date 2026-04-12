@@ -32,4 +32,9 @@ To resolve the CPU overhead and color problems, we entirely replaced the Python 
 The continuous stream loop prevented the IPU6 ISYS from sleeping, causing `-EBUSY` when attempting to close the laptop lid.
 *   **Kernel Fix:** We added `SET_SYSTEM_SLEEP_PM_OPS` to `gc2607.c` so the kernel could forcibly power down the sensor via the existing runtime PM hooks upon a sleep signal.
 *   **Service Fix:** Added `Conflicts=sleep.target` to the systemd service to tear down gracefully before sleep.
-*   **Lazy Activation:** We refactored `gc2607_isp.c` to use a polling loop (`/proc/<pid>/fd`) on the `v4l2loopback` device. It now sits at ~0.7% CPU, writing a black standby frame to keep PipeWire/WirePlumber happy, and only powers up the sensor hardware when a consumer app attempts to read from `/dev/video50`. AE/AWB states were made `static` so they persist across these activation boundaries without overexposing on startup.
+*   **Lazy Activation:** We refactored `gc2607_isp.c` to use inotify on `/dev/video50`. It now sits at ~0.7% CPU, writing a black standby frame to keep PipeWire/WirePlumber happy, and only powers up the sensor hardware when a consumer app attempts to read from `/dev/video50`. AE/AWB states were made `static` so they persist across these activation boundaries without overexposing on startup.
+
+### Phase 9: Consumer Detection Reliability Fix
+inotify `IN_OPEN`/`IN_CLOSE` events on V4L2 character devices are unreliable at the kernel level — missed events caused `consumer_count` to drop to zero mid-stream, making the ISP incorrectly stop streaming after ~10s.
+*   **Fix:** Added a `/proc/<PID>/fd` scan as ground-truth fallback in `get_consumer_count()`. Every 2s (the existing poll interval), both inotify and `/proc` are checked. If `/proc` says consumers exist, streaming continues; if `/proc` says zero, it is always believed over inotify. The ISP's own PID is excluded to avoid counting its permanently-open `out_fd`.
+*   **Result:** Stream now holds for the full consumer session. Verified live: 150+ frames with no drop where it previously always failed.
