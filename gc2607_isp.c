@@ -32,6 +32,8 @@
 #include <sys/mman.h>
 #include <sys/inotify.h>
 #include <sys/select.h>
+#include <dirent.h>
+#include <limits.h>
 #include <linux/videodev2.h>
 
 /* Sensor parameters */
@@ -502,6 +504,92 @@ static void cleanup_inotify(void)
 }
 
 /*
+ * Count how many processes currently have output_dev open by scanning
+ * /proc/<PID>/fd/<N> symlinks. Used as a fallback when inotify misses
+ * IN_OPEN/IN_CLOSE events on V4L2 character devices.
+ *
+ * Resolves the real path of output_dev once (via realpath) then compares
+ * symlink targets. Gracefully skips entries we cannot read.
+ */
+static int count_proc_consumers(const char *output_dev)
+{
+    static char real_dev[PATH_MAX];
+    static int resolved;
+    if (!resolved) {
+        if (!realpath(output_dev, real_dev))
+            return 0;
+        resolved = 1;
+    }
+
+    DIR *proc = opendir("/proc");
+    if (!proc)
+        return 0;
+
+    int count = 0;
+    pid_t self = getpid();
+    struct dirent *pid_ent;
+    while ((pid_ent = readdir(proc)) != NULL) {
+        /* Only numeric entries (PIDs) */
+        if (pid_ent->d_name[0] < '1' || pid_ent->d_name[0] > '9')
+            continue;
+
+        /* Skip our own process — we hold out_fd open permanently */
+        if (atoi(pid_ent->d_name) == self)
+            continue;
+
+        char fd_dir[PATH_MAX];
+        snprintf(fd_dir, sizeof(fd_dir), "/proc/%s/fd", pid_ent->d_name);
+
+        DIR *fds = opendir(fd_dir);
+        if (!fds)
+            continue;
+
+        struct dirent *fd_ent;
+        while ((fd_ent = readdir(fds)) != NULL) {
+            if (fd_ent->d_name[0] == '.')
+                continue;
+
+            char link_path[PATH_MAX];
+            snprintf(link_path, sizeof(link_path), "/proc/%s/fd/%s",
+                     pid_ent->d_name, fd_ent->d_name);
+
+            char target[PATH_MAX];
+            ssize_t n = readlink(link_path, target, sizeof(target) - 1);
+            if (n > 0) {
+                target[n] = '\0';
+                if (strcmp(target, real_dev) == 0)
+                    count++;
+            }
+        }
+        closedir(fds);
+    }
+    closedir(proc);
+    return count;
+}
+
+/*
+ * Return the best estimate of the current consumer count.
+ * inotify is the fast path; /proc is the ground-truth fallback.
+ * We trust whichever reports more consumers, except when /proc says
+ * zero we always believe it (inotify missed a close).
+ */
+static int get_consumer_count(const char *output_dev)
+{
+    drain_inotify();
+    int proc_count = count_proc_consumers(output_dev);
+
+    if (proc_count == 0) {
+        /* Ground truth: nobody has the device open */
+        consumer_count = 0;
+        return 0;
+    }
+    /* Trust the higher of the two */
+    if (proc_count > consumer_count)
+        consumer_count = proc_count;
+    return consumer_count;
+}
+
+/*
  * Run the streaming loop: capture frames from the sensor, process them
  * through the ISP pipeline, and write to the output device.
  *
@@ -511,7 +599,8 @@ static void cleanup_inotify(void)
  * Returns: 0 on clean consumer-loss exit, -1 on error.
  */
 static int streaming_loop(const char *capture_dev, int out_fd,
-                          const char *subdev_path, int has_subdev)
+                          const char *subdev_path, int has_subdev,
+                          const char *output_dev)
 {
     struct buffer buffers[NUM_BUFFERS];
     int n_buffers = 0;
@@ -655,8 +744,7 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         );
         if (since_check >= CONSUMER_CHECK_INTERVAL_S) {
             last_consumer_check = now;
-            drain_inotify();
-            if (consumer_count <= 0) {
+            if (get_consumer_count(output_dev) <= 0) {
                 no_consumer_count++;
                 if (no_consumer_count >= 5) {
                     printf("[gc2607_isp] No consumers detected, stopping stream (%d frames)\n",
@@ -752,11 +840,11 @@ int main(int argc, char *argv[])
         if (sel > 0)
             drain_inotify();
 
-        if (consumer_count > 0) {
+        if (get_consumer_count(output_dev) > 0) {
             printf("[gc2607_isp] %d consumer(s) detected, starting stream...\n",
                    consumer_count);
             int ret = streaming_loop(capture_dev, out_fd,
-                                     subdev_path, has_subdev);
+                                     subdev_path, has_subdev, output_dev);
             if (ret < 0 && running) {
                 printf("[gc2607_isp] Streaming error, retrying in 2s...\n");
                 sleep(2);
