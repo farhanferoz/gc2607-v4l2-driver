@@ -51,6 +51,14 @@ gc2607 sensor (SGRBG10 raw 10-bit Bayer)
 - **Format limits**: The kernel uses Linux standard coding style for C.
 - **Dependencies**: The ISP must remain pure executable C requiring no external interpretation (Do not use Python/NumPy for camera streaming due to excessive overhead).
 
+## Hardware ISP Status (BLOCKED — April 2026)
+
+The IPU6 PSYS hardware ISP could replace the software ISP but is blocked by a missing
+kernel bridge (BE SOC) in the mainline ISYS driver. All calibration files from Windows
+are extracted and ready in `hal-config/tuning/`. The HAL recognizes the sensor but
+produces zero frames. See `docs/hardware_isp_investigation.md` for full details and
+what to search for to check if this is unblocked.
+
 ## Common Pitfalls
 
 - **Module xz compression**: Fedora's kernel module loader expects `xz --check=crc32`. Default xz uses CRC64 which causes `decompression failed with status 6`.

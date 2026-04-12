@@ -38,3 +38,11 @@ The continuous stream loop prevented the IPU6 ISYS from sleeping, causing `-EBUS
 inotify `IN_OPEN`/`IN_CLOSE` events on V4L2 character devices are unreliable at the kernel level — missed events caused `consumer_count` to drop to zero mid-stream, making the ISP incorrectly stop streaming after ~10s.
 *   **Fix:** Added a `/proc/<PID>/fd` scan as ground-truth fallback in `get_consumer_count()`. Every 2s (the existing poll interval), both inotify and `/proc` are checked. If `/proc` says consumers exist, streaming continues; if `/proc` says zero, it is always believed over inotify. The ISP's own PID is excluded to avoid counting its permanently-open `out_fd`.
 *   **Result:** Stream now holds for the full consumer session. Verified live: 150+ frames with no drop where it previously always failed.
+
+### Phase 10: Hardware ISP Investigation (April 2026)
+We investigated whether Intel's IPU6 hardware ISP (PSYS) could replace the software ISP for better image quality and lower CPU usage.
+*   **Tuning files extracted:** Mounted the Windows partition and found the proprietary `.aiqb` tuning file, graph settings XML, and `.cpf` calibration data at `C:\Windows\System32\DriverStore\FileRepository\gc2607.inf_amd64_5924907c31b80ed6\`. These are stored in `hal-config/tuning/`.
+*   **PSYS module works:** The `intel_ipu6_psys` kernel module built and loaded successfully on kernel 6.19 via RPM Fusion `akmod-intel-ipu6`.
+*   **HAL recognizes GC2607:** We created a sensor config XML (`hal-config/gc2607-uf.xml`), registered it in `libcamhal_profile.xml`, and the HAL enumerated the sensor as `device-name=gc2607-uf` and loaded the `.aiqb`.
+*   **Blocker: Zero frames produced.** The mainline ISYS (in kernel since 6.10) lacks "BE SOC" bridge entities needed to route raw frames into PSYS. These exist only in Intel's out-of-tree `ipu6-drivers` which stopped at kernel 6.17. The out-of-tree IPU core is incompatible with the in-tree version — they cannot be mixed. We also tried forcing the ISYS-only media path (removing BE SOC config), but PSYS still produced no output.
+*   **Conclusion:** Hardware ISP is blocked by a kernel-level gap that only Intel can fix. All config/tuning files are preserved for future use. Full details in `docs/hardware_isp_investigation.md`.
