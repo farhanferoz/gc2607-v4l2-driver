@@ -2,7 +2,7 @@
 
 This document serves as the chronological save-state for the GC2607 camera driver project. Agents should read this to understand *how* the system evolved, what was tried, and exactly what the current state is.
 
-## 1. Current State (As of April 2026)
+## 1. Current State (As of May 2026)
 
 **STATUS: FULLY FUNCTIONAL AND EFFICIENT**
 
@@ -46,3 +46,19 @@ We investigated whether Intel's IPU6 hardware ISP (PSYS) could replace the softw
 *   **HAL recognizes GC2607:** We created a sensor config XML (`hal-config/gc2607-uf.xml`), registered it in `libcamhal_profile.xml`, and the HAL enumerated the sensor as `device-name=gc2607-uf` and loaded the `.aiqb`.
 *   **Blocker: Zero frames produced.** The mainline ISYS (in kernel since 6.10) lacks "BE SOC" bridge entities needed to route raw frames into PSYS. These exist only in Intel's out-of-tree `ipu6-drivers` which stopped at kernel 6.17. The out-of-tree IPU core is incompatible with the in-tree version — they cannot be mixed. We also tried forcing the ISYS-only media path (removing BE SOC config), but PSYS still produced no output.
 *   **Conclusion:** Hardware ISP is blocked by a kernel-level gap that only Intel can fix. All config/tuning files are preserved for future use. Full details in `docs/hardware_isp_investigation.md`.
+
+### Phase 11: Fedora 44 Upgrade — Regressions and HAL Re-investigation (May 2026)
+After upgrading Fedora 43 → 44 (kernel 6.19.14-300.fc44, GNOME 48), four user-visible regressions appeared:
+*   **Camera service failed at boot** because F44's `v4l2loopback` and `v4l2-relayd` packages auto-load `v4l2loopback` early with default parameters. Our service's `modprobe -r` then `modprobe video_nr=50` is a silent no-op once the module is held open. Combined with `Restart=on-abnormal` (which doesn't cover non-zero exits), the service stayed dead. **Fix:** mask the four autoload files via `/etc/{modules,modprobe}.d/*.conf → /dev/null`, change `Restart=on-failure`.
+*   **Suspend hung** after one attempt used `deep` instead of `s2idle`. Meteor Lake firmware doesn't support S3 at all; the system tried, failed, never woke. **Fix:** `grubby --update-kernel=ALL --args="mem_sleep_default=s2idle"`.
+*   **Brightness flickered** because GNOME 48's adaptive brightness is on by default and the kernel now exposes ALS readings continuously. **Fix:** `gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false`.
+*   Full details: `docs/incidents/2026-05-fedora-44-regressions.md`. All four fixes verified against authoritative documentation before applying.
+
+The April hardware-ISP investigation was reopened on F44 with initial optimism — `intel_ipu6_psys` is loaded at boot, HAL packages ship Meteor Lake config files for GC2607 (`/usr/share/defaults/etc/camera/ipu6epmtl/`), and `gstreamer1-plugins-icamerasrc` is available. Phase 1 diagnostic (LD_DEBUG plugin trace, MediaCtl pipeline diff, `availableSensors` audit) plus targeted upstream research closed the question:
+
+*   **Closed: HW ISP path is infeasible** on this hardware/sensor as of May 2026. Three independent blockers, each fatal:
+    1.  Mainline kernel has no PSYS module (the HW ISP doing Bayer→NV12). Intel keeps PSYS firmware/algorithms proprietary and **will not upstream it**. Mainline 6.10+ has only ISYS (raw CSI receiver). Architectural, not a missing patch.
+    2.  Out-of-tree proprietary stack is unmaintained — `intel/ipu6-drivers` and RPMFusion's `akmod-intel-ipu6` stopped tracking kernel API changes ~Dec 2024 / Jan 2025; F44 ships kernel ≥6.17.
+    3.  GC2607 was never accepted into Intel's IPU6 driver tree — `intel/ipu6-drivers` Issue #272 (Oct 2024) is still open. F44's shipped `gc2607-uf.xml` had its BE SOC pipeline stripped (because the kernel side doesn't exist), and `gc2607-uf` is absent from `availableSensors` in `libcamhal_profile.xml`.
+*   The April framing ("blocked by missing BE SOC bridge") was incomplete — it implied a missing puzzle piece, when the real story is upstream policy. Even with kernel updates, HW ISP would still need (a) GC2607 patches landed in Intel's tree, (b) the proprietary stack actively maintained against the current kernel, and (c) Intel reversing the PSYS-is-proprietary policy.
+*   **Conclusion:** `gc2607_isp.c` software ISP (~4% CPU) is **the only viable path** for this sensor on this laptop — not a workaround, the answer. Full analysis with sources in `docs/native_hal_investigation.md`. Quarterly-check criteria documented there; tracked in `RESUME.md`.

@@ -34,6 +34,15 @@ gc2607 sensor (SGRBG10 raw 10-bit Bayer)
 - **Gain via LUT**: Analogue gain uses a 17-entry lookup table (index 0-16) that writes to 4 registers simultaneously.
 - **Power Management**: Requires `SET_SYSTEM_SLEEP_PM_OPS` alongside `SET_RUNTIME_PM_OPS` to properly release the hardware during system suspend so that it doesn't cause `-EBUSY` kernel panics.
 
+### Service Lifecycle (Suspend/Resume)
+
+The `gc2607-camera.service` lifecycle is controlled by **two** coordinated pieces. Both must be preserved:
+
+1. `Conflicts=sleep.target` in the service file — stops the service cleanly on suspend to prevent `-EBUSY` kernel panics.
+2. `/usr/lib/systemd/system-sleep/gc2607-resume` sleep hook — restarts the service on the `post` event after resume. Source tracked in repo as `gc2607-resume`.
+
+`Restart=on-abnormal` does NOT cover clean stops, so without the hook the service stays dead after the first suspend. See `docs/incidents/2026-04-suspend-resume-failure.md`.
+
 ## Hardware Details
 
 | Parameter | Value |
@@ -51,13 +60,40 @@ gc2607 sensor (SGRBG10 raw 10-bit Bayer)
 - **Format limits**: The kernel uses Linux standard coding style for C.
 - **Dependencies**: The ISP must remain pure executable C requiring no external interpretation (Do not use Python/NumPy for camera streaming due to excessive overhead).
 
-## Hardware ISP Status (BLOCKED — April 2026)
+## Hardware ISP / Native HAL Stack Status (CLOSED — INFEASIBLE — May 2026)
 
-The IPU6 PSYS hardware ISP could replace the software ISP but is blocked by a missing
-kernel bridge (BE SOC) in the mainline ISYS driver. All calibration files from Windows
-are extracted and ready in `hal-config/tuning/`. The HAL recognizes the sensor but
-produces zero frames. See `docs/hardware_isp_investigation.md` for full details and
-what to search for to check if this is unblocked.
+The IPU6 hardware ISP path is **dead-end on this hardware/sensor** as of May 2026. Three
+independent blockers, any one fatal:
+1. **Mainline kernel has no PSYS module** (the HW ISP doing Bayer→NV12). Intel considers
+   PSYS firmware/algorithms proprietary and **will not upstream it**. Mainline 6.10+ has
+   only ISYS (raw CSI receiver).
+2. **Out-of-tree proprietary stack is unmaintained.** RPMFusion `akmod-intel-ipu6` and
+   Intel's `intel/ipu6-drivers` repo stopped tracking kernel API changes around v6.16
+   (Dec 2024 / Jan 2025). F44 ships kernel ≥6.17.
+3. **GC2607 was never accepted into Intel's IPU6 driver tree.**
+   [Issue #272](https://github.com/intel/ipu6-drivers/issues/272) (Oct 2024) is still
+   open with no progress. F44's shipped `gc2607-uf.xml` HAL config has the BE SOC pipeline
+   stripped (because the kernel side doesn't exist) and `gc2607-uf` is absent from
+   `availableSensors` in `libcamhal_profile.xml`.
+
+**Conclusion:** The custom `gc2607_isp.c` software ISP (~4% CPU) is **the only viable path**
+for this sensor on this laptop. It is not a workaround — it is the answer. See
+`docs/native_hal_investigation.md` for full analysis and quarterly-check criteria for
+reopening if upstream policy changes.
+
+## Fedora 44 Setup Notes (post-upgrade)
+
+After Fedora 43 → 44, four regressions were identified and fixed (see
+`docs/incidents/2026-05-fedora-44-regressions.md`):
+1. F44's `v4l2loopback` and `v4l2-relayd` packages auto-load v4l2loopback at boot, which
+   conflicts with our service. We mask their autoload via `/etc/{modules,modprobe}.d/*.conf
+   → /dev/null` symlinks. **Do not unmask these** unless decommissioning the custom service.
+2. The service's `Restart=on-abnormal` was changed to `on-failure` so non-zero exits trigger
+   retry (per `systemd.service(5)`).
+3. `mem_sleep_default=s2idle` is pinned on the kernel cmdline (Meteor Lake firmware doesn't
+   support deep S3).
+4. GNOME adaptive brightness is disabled (`org.gnome.settings-daemon.plugins.power
+   ambient-enabled=false`).
 
 ## Common Pitfalls
 
