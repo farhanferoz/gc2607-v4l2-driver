@@ -150,15 +150,20 @@ Listed in order of likely effort-to-payoff.
   the pre-session highlight protection level. Try first if walls clip in
   real use now that LTM isn't there to compress them in display space.
 
-### B. Raise `LTM_KNEE` to ≥ 200 and re-enable
-- Theory: face skin (even well-lit forehead) tops out around Y=180.
-  Setting `LTM_KNEE = 200` means face cells never trigger compression;
-  only walls/sky/ceiling do. No face-internal patch possible.
-- Risk: wall compression contribution becomes much smaller — the bright
-  cells need to be quite saturated to even cross the knee, so LTM may
-  not buy much over the existing highlight cap.
-- Re-enable by replacing `(void)apply_ltm;` with
-  `apply_ltm(yuyv_buf, OUT_W, OUT_H);` in the main loop.
+### B. ~~Raise `LTM_KNEE` to ≥ 200 and re-enable~~ — TESTED, FAILED
+- Theory was: face skin (even well-lit forehead) tops out around Y=180;
+  setting `LTM_KNEE = 200` means face cells never trigger compression,
+  so no face-internal patch should be possible.
+- Reality: tested at `LTM_KNEE = 200`. Forehead patches **still appear
+  when the user moves**, because well-lit skin transients (cheekbones,
+  forehead highlights, motion-induced exposure shifts) cross Y=200
+  intermittently. Each frame the patch boundary lands on a different
+  set of cells and renders as a flickering compressed region.
+- Lesson: the artefact isn't about *where* the knee is — it's that any
+  knee on a 60×34 grid against a textured signal will produce visible
+  cell-boundary jumps whenever the threshold crossing isn't aligned
+  with a natural luma edge. Cell-grid LTM with a hard knee is
+  fundamentally incompatible with face skin in this pipeline.
 
 ### C. Highlight-only LTM (threshold gate)
 - Modify the per-cell factor function: factor = 1.0 unless mean Y >

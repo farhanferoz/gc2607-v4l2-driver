@@ -1063,11 +1063,15 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         /* Multi-zone AE target: mean green of the darkest 25% of zones. */
         float g_target = compute_ae_zone_target();
 
-        /* LTM disabled: a fixed knee on a 60x34 grid segments face skin
-         * (forehead vs. cheek) into compressed/uncompressed cells and the
-         * bilinear upsample renders that as a visible patch on the face.
-         * Dual-constraint AGC (shadow-priority target + highlight cap)
-         * already handles backlit scenes without this side effect. */
+        /* LTM permanently disabled. Both KNEE=120 (Y-threshold inside
+         * skin midtones) and KNEE=200 (only true highlights) produce
+         * visible forehead patches when the user moves — any frame in
+         * which skin luma crosses the knee shifts the cell-grid factor
+         * boundary, which the bilinear factor upsample renders as a
+         * moving artefact. The bilateral grid smoothing fixes silhouette
+         * halos but is powerless against this in-skin transition. The
+         * fundamental problem is "hard threshold on a coarse grid against
+         * a textured signal" — no knee value escapes it on face skin. */
         (void)apply_ltm;
 
         /* Update white balance (gray-world, no offsets) */
