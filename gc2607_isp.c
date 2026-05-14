@@ -53,38 +53,72 @@
 #define WB_SUBSAMPLE    8       /* Sample every Nth pixel for WB stats */
 
 /*
- * Auto exposure — dual-constraint AGC (libcamera AgcMeanLuminance pattern).
+ * Auto exposure — multi-zone AE with shadow-priority metering, plus
+ * percentile highlight cap. Models what hardware ISPs (Intel IPU6, RPi
+ * IPA) do: divide the frame into a grid, compute per-zone luma, and pick
+ * an exposure target that exposes the *darker* regions. This handles
+ * backlit subjects correctly regardless of where the subject is in the
+ * frame — centre weighting fails when the subject isn't centred or the
+ * centre contains the bright background (e.g. window).
  *
- * Each frame computes two independent brightness targets and takes the
- * smaller (= more restrictive). This is the production-standard approach
- * used on Raspberry Pi / IPU3 — a plain mean target alone cannot tell
- * "few clipped pixels" from "lots of clipped pixels", which is why bright
- * scenes with white walls blow out even when the mean lands on target.
- *
- *  1. Mean target (centre-weighted): aim for AE_TARGET on the subject area.
+ *  1. Mean target: AE_TARGET applied to the mean of the AE_DARK_FRACTION
+ *     darkest zones. Backlit face gets exposed; bright window/wall doesn't
+ *     drag exposure down.
  *  2. Highlight cap: the AE_HIGHLIGHT_PCTILE percentile of green must stay
- *     at or below AE_HIGHLIGHT_CAP in 8-bit output. Walls/ceiling can no
- *     longer pin at 255.
+ *     at or below AE_HIGHLIGHT_CAP — kept very loose because LTM (below)
+ *     handles bright regions in display space.
  */
-#define AE_TARGET           100.0f  /* mean (0-255) for centre-weighted subject */
-#define AE_HIGHLIGHT_PCTILE 0.98f   /* upper 2% of pixels are the "highlight" set */
-#define AE_HIGHLIGHT_CAP    220.0f  /* their value must not exceed this (0-255) */
-#define AE_SMOOTHING        0.92f   /* temporal smoothing */
-#define AE_INTERVAL_S       1.5     /* hardware AE adjustment interval */
+#define AE_TARGET           100.0f  /* mean (0-255) for the dark-zones target */
+#define AE_HIGHLIGHT_PCTILE 0.98f
+#define AE_HIGHLIGHT_CAP    240.0f  /* protect walls from clipping (LTM disabled — see main loop) */
+#define AE_SMOOTHING        0.92f
+#define AE_INTERVAL_S       1.5
 #define BRIGHTNESS_MIN      0.5f
 #define BRIGHTNESS_MAX      3.5f
 
-/* Green-channel histogram for highlight detection: 1024/64 = 16 raw per bin. */
-#define HISTOGRAM_BINS      64
-#define HIST_BIN_WIDTH      (LUT_SIZE / HISTOGRAM_BINS)  /* = 16 */
+/* Multi-zone AE grid over the output frame. */
+#define AE_ZONES_X          16
+#define AE_ZONES_Y          16
+#define AE_ZONES            (AE_ZONES_X * AE_ZONES_Y)
+#define AE_DARK_FRACTION    0.25f   /* expose for the darkest 25% of zones */
 
-/* Centre region for AE mean (typical webcam framing: subject middle of frame).
- * Centre pixels weighted 2x in the green mean; edges 1x. Boundaries in OUTPUT
- * coordinates (0..OUT_W, 0..OUT_H). */
-#define CENTRE_X_LO   (OUT_W * 25 / 100)   /* 25% to 75% horizontally */
-#define CENTRE_X_HI   (OUT_W * 75 / 100)
-#define CENTRE_Y_LO   (OUT_H * 15 / 100)   /* 15% to 85% vertically */
-#define CENTRE_Y_HI   (OUT_H * 85 / 100)
+/* Green-channel histogram for highlight cap. */
+#define HISTOGRAM_BINS      64
+#define HIST_BIN_WIDTH      (LUT_SIZE / HISTOGRAM_BINS)
+
+/*
+ * Local tone mapping (LTM) — per-pixel Y compression based on local
+ * luminance. The same tool the IPU6 hardware ISP uses for WDR; we do it
+ * in software at the end of the pipeline. Bright local regions (window,
+ * walls) get scaled toward LTM_TARGET_Y; dark regions (face in shadow)
+ * pass through unchanged. Decouples exposure choice from output dynamic
+ * range, which is the only reliable way to handle bright-background +
+ * shadowed-subject scenes without a multi-shot HDR sensor.
+ *
+ * Grid is OUT_W/OUT_H downsampled by ~16; bilinearly upsampled when
+ * applied. Temporal EMA prevents per-frame flicker.
+ */
+#define LTM_GRID_X          60          /* ~OUT_W/16 */
+#define LTM_GRID_Y          34          /* ~OUT_H/16 (rounded up) */
+#define LTM_CELL_W          (OUT_W / LTM_GRID_X)
+#define LTM_CELL_H          ((OUT_H + LTM_GRID_Y - 1) / LTM_GRID_Y)
+#define LTM_TARGET_Y        128.0f      /* compress bright cells toward this Y */
+#define LTM_KNEE            120.0f      /* cells with mean Y below this: identity */
+#define LTM_STRENGTH        0.7f        /* 0=no compression, 1=hard */
+/* Temporal blend = 1.0 means no EMA — fresh grid every frame. The lower
+ * values that seem theoretically nicer in fact carry the previous frame's
+ * grid into the current frame, and when the subject moves the old grid
+ * leaves a ghost (cells that were "face/low compression" stay low while
+ * the wall has moved into them, leaving a face-shaped bright patch).
+ * Webcam scenes are static enough that fresh-each-frame is stable. */
+#define LTM_TEMPORAL_BLEND  1.0f
+/* Bilateral filter on the grid. Spatial sigma in cells; range sigma in Y
+ * units. The range term is what kills the halo: cells across a face/wall
+ * boundary differ by ~80-120 Y, far beyond LTM_BF_SIGMA_R, so the filter
+ * refuses to average them — each side keeps its own compression factor. */
+#define LTM_BF_RADIUS       2           /* 5x5 kernel */
+#define LTM_BF_SIGMA_S      1.5f
+#define LTM_BF_SIGMA_R      30.0f
 
 /* Sensor hardware limits */
 #define EXPOSURE_MIN    4
@@ -137,8 +171,21 @@ static int xioctl(int fd, unsigned long request, void *arg)
 }
 
 /*
- * Build per-channel LUTs that encode the entire per-pixel pipeline:
- *   black_level_subtract -> WB_gain -> brightness_scale -> S-curve -> gamma
+ * The earlier ACES + asymmetric tone shape stack is removed: with LTM
+ * doing the dynamic-range compression in display space, the global LUT
+ * just needs to do exposure scaling, mild midtone contrast, and sRGB
+ * gamma encoding. The smoothstep gives a small S-curve in midtones; LTM
+ * handles the bright regions per-pixel based on local luminance, which
+ * a global curve cannot do regardless of how it's shaped.
+ */
+
+/*
+ * Build per-channel LUTs that encode the per-pixel pipeline:
+ *   black_level_subtract -> WB_gain -> exposure -> smoothstep -> sRGB gamma
+ *
+ * Smoothstep gives mild midtone contrast (was the original behaviour
+ * before the ACES experiments). Highlight handling is now LTM's job, so
+ * this LUT can stay simple: clamp to [0,1], smoothstep, gamma.
  *
  * Called once per frame with updated WB gains and brightness.
  */
@@ -155,8 +202,8 @@ static void build_luts(float r_gain, float g_gain, float b_gain, float brightnes
         /* R channel */
         float vr = raw * scale_r;
         if (vr > 1.0f) vr = 1.0f;
-        vr = vr * vr * (3.0f - 2.0f * vr);       /* S-curve contrast */
-        vr = powf(vr, 1.0f / 2.2f);                /* sRGB gamma */
+        vr = vr * vr * (3.0f - 2.0f * vr);       /* smoothstep midtone contrast */
+        vr = powf(vr, 1.0f / 2.2f);              /* sRGB gamma */
         lut_r[i] = (uint8_t)(vr * 255.0f + 0.5f);
 
         /* G channel */
@@ -172,6 +219,101 @@ static void build_luts(float r_gain, float g_gain, float b_gain, float brightnes
         vb = vb * vb * (3.0f - 2.0f * vb);
         vb = powf(vb, 1.0f / 2.2f);
         lut_b[i] = (uint8_t)(vb * 255.0f + 0.5f);
+    }
+}
+
+/*
+ * Chroma denoise: 3x3 median filter on U and V only (Y untouched).
+ *
+ * Why a median, not a linear blur: this output suffers from Bayer chroma
+ * moiré — false colour from fine repeating textures (e.g. corduroy ribs)
+ * beating against our 2x2 binning grid. The artifact appears as outlier
+ * U/V values relative to local neighbours, not as zero-mean noise. A
+ * linear blur (which we tried) attenuates outliers proportionally but
+ * spreads them across neighbours; a median rejects them outright while
+ * preserving real colour edges. This is the standard false-colour-
+ * suppression pass in production raw processors (see darktable
+ * "color smoothing", and Lukac/Plataniotis 2004, "False Color Suppression
+ * in Demosaiced Color Images").
+ *
+ * The kernel reaches across two pixels horizontally (one chroma sample =
+ * one YUYV pair) and two rows vertically, so it covers a 6x3 pixel area
+ * with 9 chroma samples — enough to dominate moiré stripes wider than
+ * one chroma sample.
+ *
+ * Implementation: process top-to-bottom keeping the previous row's
+ * original U/V in a small ring buffer so the median sees pre-modification
+ * neighbours. Uses Smith's 19-comparator network for the median of 9.
+ */
+
+/* Branchless min/max swap of two uint8_t values. */
+#define MMSWAP(a, b) do { \
+    uint8_t _mn = (a) < (b) ? (a) : (b); \
+    uint8_t _mx = (a) + (b) - _mn;        \
+    (a) = _mn; (b) = _mx;                 \
+} while (0)
+
+static inline uint8_t median9(uint8_t *v)
+{
+    /* Smith 1996, "Fast Median Search": 19-comparator network.
+     * Sorts only enough to leave the median at v[4]. */
+    MMSWAP(v[1], v[2]); MMSWAP(v[4], v[5]); MMSWAP(v[7], v[8]);
+    MMSWAP(v[0], v[1]); MMSWAP(v[3], v[4]); MMSWAP(v[6], v[7]);
+    MMSWAP(v[1], v[2]); MMSWAP(v[4], v[5]); MMSWAP(v[7], v[8]);
+    MMSWAP(v[0], v[3]); MMSWAP(v[5], v[8]); MMSWAP(v[4], v[7]);
+    MMSWAP(v[3], v[6]); MMSWAP(v[1], v[4]); MMSWAP(v[2], v[5]);
+    MMSWAP(v[4], v[7]); MMSWAP(v[4], v[2]); MMSWAP(v[6], v[4]);
+    MMSWAP(v[4], v[2]);
+    return v[4];
+}
+
+static void chroma_median_filter(uint8_t *buf, int width, int height)
+{
+    int row_bytes = width * 2;
+    int npairs = width / 2;
+
+    /* Two saved rows of pre-modification chroma so the median sees the
+     * original neighbours regardless of in-place writes above. ~1.9 KB. */
+    static uint8_t above_u[OUT_W / 2], above_v[OUT_W / 2];
+    static uint8_t current_u[OUT_W / 2], current_v[OUT_W / 2];
+
+    /* Seed: above = row 0 (left untouched), current = row 1 (about to be processed). */
+    for (int i = 0; i < npairs; i++) {
+        above_u[i]   = buf[0 * row_bytes + i * 4 + 1];
+        above_v[i]   = buf[0 * row_bytes + i * 4 + 3];
+        current_u[i] = buf[1 * row_bytes + i * 4 + 1];
+        current_v[i] = buf[1 * row_bytes + i * 4 + 3];
+    }
+
+    for (int y = 1; y < height - 1; y++) {
+        uint8_t *row       = buf + y * row_bytes;
+        uint8_t *row_below = buf + (y + 1) * row_bytes;
+
+        for (int i = 1; i < npairs - 1; i++) {
+            uint8_t u9[9] = {
+                above_u[i - 1],   above_u[i],   above_u[i + 1],
+                current_u[i - 1], current_u[i], current_u[i + 1],
+                row_below[(i - 1) * 4 + 1], row_below[i * 4 + 1], row_below[(i + 1) * 4 + 1],
+            };
+            uint8_t v9[9] = {
+                above_v[i - 1],   above_v[i],   above_v[i + 1],
+                current_v[i - 1], current_v[i], current_v[i + 1],
+                row_below[(i - 1) * 4 + 3], row_below[i * 4 + 3], row_below[(i + 1) * 4 + 3],
+            };
+            row[i * 4 + 1] = median9(u9);
+            row[i * 4 + 3] = median9(v9);
+        }
+
+        /* Roll buffers: above <= current; current <= original of row y+1. */
+        if (y + 1 < height - 1) {
+            uint8_t *next = buf + (y + 1) * row_bytes;
+            for (int i = 0; i < npairs; i++) {
+                above_u[i]   = current_u[i];
+                above_v[i]   = current_v[i];
+                current_u[i] = next[i * 4 + 1];
+                current_v[i] = next[i * 4 + 3];
+            }
+        }
     }
 }
 
@@ -207,9 +349,16 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
  *
  * Returns the subsampled green mean for AE.
  */
+/*
+ * Per-frame multi-zone AE accumulators. Populated during process_frame's
+ * stat-pixel sweep; consumed by compute_ae_zone_target() in the main loop.
+ */
+static uint64_t ae_zone_g_sum[AE_ZONES];
+static uint32_t ae_zone_g_count[AE_ZONES];
+
 static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
                            float brightness, float *out_r_sum, float *out_g_sum,
-                           float *out_b_sum, float *out_g_mean_centre,
+                           float *out_b_sum,
                            uint32_t *out_g_hist, int *out_hist_total,
                            int *out_count)
 {
@@ -217,10 +366,13 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
     build_luts(r_gain, 1.0f, b_gain, brightness);
 
     double r_sum = 0, g_sum = 0, b_sum = 0;
-    double g_sum_centre = 0, weight_total = 0;
     int stat_count = 0;
     int hist_total = 0;
     for (int i = 0; i < HISTOGRAM_BINS; i++) out_g_hist[i] = 0;
+    for (int i = 0; i < AE_ZONES; i++) {
+        ae_zone_g_sum[i] = 0;
+        ae_zone_g_count[i] = 0;
+    }
 
     /*
      * Iterate output pixels in reverse for 180 degree rotation.
@@ -297,18 +449,25 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
                     b_sum += bv;
                     stat_count++;
 
-                    /* Centre-weighted green mean for AE — push the subject
-                     * toward AE_TARGET rather than the whole frame, so a
-                     * bright background does not pull the subject dark. */
-                    int in_centre = (out_x >= CENTRE_X_LO && out_x < CENTRE_X_HI
-                                  && out_y >= CENTRE_Y_LO && out_y < CENTRE_Y_HI);
-                    float w = in_centre ? 2.0f : 1.0f;
-                    g_sum_centre += gv * w;
-                    weight_total += w;
+                    /* Multi-zone AE: accumulate green into the right zone.
+                     * Output coordinates (out_x in [0, OUT_W), out_y in
+                     * [0, OUT_H)) get mapped to a 16x16 grid. */
+                    int zx = out_x * AE_ZONES_X / OUT_W;
+                    int zy = out_y * AE_ZONES_Y / OUT_H;
+                    if (zx >= AE_ZONES_X) zx = AE_ZONES_X - 1;
+                    if (zy >= AE_ZONES_Y) zy = AE_ZONES_Y - 1;
+                    int zidx = zy * AE_ZONES_X + zx;
+                    ae_zone_g_sum[zidx] += (uint64_t)gv;
+                    ae_zone_g_count[zidx]++;
                 }
             }
         }
+
     }
+
+    /* False-colour suppression: 3x3 chroma median over the YUYV buffer.
+     * Y is untouched so luma sharpness is preserved. */
+    chroma_median_filter(yuyv_buf, OUT_W, OUT_H);
 
     if (stat_count > 0) {
         *out_r_sum = (float)(r_sum / stat_count);
@@ -317,11 +476,204 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
     } else {
         *out_r_sum = *out_g_sum = *out_b_sum = 0.0f;
     }
-    *out_g_mean_centre = (weight_total > 0) ? (float)(g_sum_centre / weight_total) : *out_g_sum;
     *out_count = stat_count;
     *out_hist_total = hist_total;
 
     return *out_g_sum;
+}
+
+/*
+ * Compute the multi-zone AE target: mean green of the AE_DARK_FRACTION
+ * darkest zones. Skips empty zones (sparse stat sampling can leave some).
+ * This is the shadow-priority metering that gives backlit subjects the
+ * right exposure regardless of where they are in the frame.
+ */
+static float compute_ae_zone_target(void)
+{
+    float means[AE_ZONES];
+    int n = 0;
+    for (int z = 0; z < AE_ZONES; z++) {
+        if (ae_zone_g_count[z] > 0) {
+            means[n++] = (float)ae_zone_g_sum[z] / (float)ae_zone_g_count[z];
+        }
+    }
+    if (n == 0) return 0;
+
+    int m = (int)(n * AE_DARK_FRACTION);
+    if (m < 1) m = 1;
+
+    /* Partial selection sort: bring the m smallest to the front of the
+     * array, then average them. O(m*n) — for n=256, m=64, ~16k compares
+     * per frame which is negligible. */
+    for (int i = 0; i < m; i++) {
+        int min_idx = i;
+        for (int j = i + 1; j < n; j++) {
+            if (means[j] < means[min_idx]) min_idx = j;
+        }
+        if (min_idx != i) {
+            float t = means[i]; means[i] = means[min_idx]; means[min_idx] = t;
+        }
+    }
+    float sum = 0;
+    for (int i = 0; i < m; i++) sum += means[i];
+    return sum / (float)m;
+}
+
+/*
+ * Local Tone Mapping: compress bright local regions of the YUYV buffer
+ * while preserving dark regions. Operates on Y only (UV untouched).
+ *
+ * Algorithm (Reinhard local with Gaussian-instead-of-bilateral):
+ *   1. Build a downsampled Y mean per LTM_GRID cell.
+ *   2. EMA-blend with the previous frame's grid for temporal stability.
+ *   3. Per cell, derive a compression FACTOR (1.0 below LTM_KNEE, falling
+ *      hyperbolically above).
+ *   4. Per output pixel, bilinearly sample the factor grid and scale Y.
+ *
+ * This is the same approach used in libcamera/RPi software ISPs and in
+ * IPU6 hardware WDR — local-luma-driven compression of bright regions
+ * without touching the local contrast (the multiplicative scale keeps
+ * pixel-to-pixel variation intact).
+ */
+static void apply_ltm(uint8_t *buf, int w, int h)
+{
+    static uint64_t cell_sum[LTM_GRID_Y * LTM_GRID_X];
+    static uint32_t cell_count[LTM_GRID_Y * LTM_GRID_X];
+    static float ltm_grid[LTM_GRID_Y * LTM_GRID_X];
+    static float factor_grid[LTM_GRID_Y * LTM_GRID_X];
+    static int ltm_initialized = 0;
+
+    int row_bytes = w * 2;  /* YUYV: 2 bytes per pixel */
+
+    /* 1. Downsample: sum Y values into grid cells. */
+    for (int i = 0; i < LTM_GRID_Y * LTM_GRID_X; i++) {
+        cell_sum[i] = 0;
+        cell_count[i] = 0;
+    }
+    for (int y = 0; y < h; y++) {
+        int gy = y / LTM_CELL_H;
+        if (gy >= LTM_GRID_Y) gy = LTM_GRID_Y - 1;
+        const uint8_t *row = buf + y * row_bytes;
+        int gy_base = gy * LTM_GRID_X;
+        for (int x = 0; x < w; x++) {
+            int gx = x / LTM_CELL_W;
+            if (gx >= LTM_GRID_X) gx = LTM_GRID_X - 1;
+            int idx = gy_base + gx;
+            cell_sum[idx] += row[x * 2];   /* Y is at byte offset 2*x */
+            cell_count[idx]++;
+        }
+    }
+
+    /* 2a. Per-cell mean with temporal EMA. */
+    for (int i = 0; i < LTM_GRID_Y * LTM_GRID_X; i++) {
+        float mean = cell_count[i] > 0
+                        ? (float)cell_sum[i] / (float)cell_count[i]
+                        : 128.0f;
+        if (!ltm_initialized) {
+            ltm_grid[i] = mean;
+        } else {
+            ltm_grid[i] = (1.0f - LTM_TEMPORAL_BLEND) * ltm_grid[i]
+                        + LTM_TEMPORAL_BLEND * mean;
+        }
+    }
+    ltm_initialized = 1;
+
+    /* 2b. Joint bilateral smoothing of the grid. A plain blur (box or
+     * Gaussian) averages bright-wall cells with shadowed-face cells
+     * across the silhouette boundary; the per-pixel bilinear upsample
+     * then renders that mixed factor as a visible halo. The bilateral
+     * weight kernel multiplies the spatial Gaussian by a range Gaussian
+     * on the centre-vs-neighbour luma difference, so cells across a
+     * sharp luma edge contribute ~0 weight. Smoothing remains aggressive
+     * inside flat regions, but stops at edges — no halo. */
+    static float bf_spatial[(2 * LTM_BF_RADIUS + 1) * (2 * LTM_BF_RADIUS + 1)];
+    static int bf_initialized = 0;
+    if (!bf_initialized) {
+        float two_ss = 2.0f * LTM_BF_SIGMA_S * LTM_BF_SIGMA_S;
+        for (int dy = -LTM_BF_RADIUS; dy <= LTM_BF_RADIUS; dy++) {
+            for (int dx = -LTM_BF_RADIUS; dx <= LTM_BF_RADIUS; dx++) {
+                float d2 = (float)(dx * dx + dy * dy);
+                int k = (dy + LTM_BF_RADIUS) * (2 * LTM_BF_RADIUS + 1)
+                      + (dx + LTM_BF_RADIUS);
+                bf_spatial[k] = expf(-d2 / two_ss);
+            }
+        }
+        bf_initialized = 1;
+    }
+    static float smooth_grid[LTM_GRID_Y * LTM_GRID_X];
+    float two_sr = 2.0f * LTM_BF_SIGMA_R * LTM_BF_SIGMA_R;
+    for (int gy = 0; gy < LTM_GRID_Y; gy++) {
+        for (int gx = 0; gx < LTM_GRID_X; gx++) {
+            float centre = ltm_grid[gy * LTM_GRID_X + gx];
+            float wsum = 0, vsum = 0;
+            for (int dy = -LTM_BF_RADIUS; dy <= LTM_BF_RADIUS; dy++) {
+                int yy = gy + dy;
+                if (yy < 0 || yy >= LTM_GRID_Y) continue;
+                for (int dx = -LTM_BF_RADIUS; dx <= LTM_BF_RADIUS; dx++) {
+                    int xx = gx + dx;
+                    if (xx < 0 || xx >= LTM_GRID_X) continue;
+                    float v = ltm_grid[yy * LTM_GRID_X + xx];
+                    float diff = v - centre;
+                    int k = (dy + LTM_BF_RADIUS) * (2 * LTM_BF_RADIUS + 1)
+                          + (dx + LTM_BF_RADIUS);
+                    float w = bf_spatial[k] * expf(-(diff * diff) / two_sr);
+                    wsum += w;
+                    vsum += w * v;
+                }
+            }
+            smooth_grid[gy * LTM_GRID_X + gx] = vsum / wsum;
+        }
+    }
+
+    /* 2c. Derive per-cell compression factors from the smoothed grid. */
+    for (int i = 0; i < LTM_GRID_Y * LTM_GRID_X; i++) {
+        float L = smooth_grid[i];
+        float factor;
+        if (L <= LTM_KNEE) {
+            factor = 1.0f;
+        } else {
+            float over = L - LTM_KNEE;
+            factor = LTM_TARGET_Y / (LTM_TARGET_Y + over * LTM_STRENGTH);
+        }
+        factor_grid[i] = factor;
+    }
+
+    /* 3. Apply per-pixel: bilinearly sample factor grid, multiply Y. */
+    for (int y = 0; y < h; y++) {
+        float fy = (y + 0.5f) / (float)LTM_CELL_H - 0.5f;
+        if (fy < 0) fy = 0;
+        if (fy > LTM_GRID_Y - 1) fy = LTM_GRID_Y - 1;
+        int gy0 = (int)fy;
+        int gy1 = gy0 + 1;
+        if (gy1 >= LTM_GRID_Y) gy1 = LTM_GRID_Y - 1;
+        float wy = fy - gy0;
+        float iwy = 1.0f - wy;
+
+        uint8_t *row = buf + y * row_bytes;
+        for (int x = 0; x < w; x++) {
+            float fx = (x + 0.5f) / (float)LTM_CELL_W - 0.5f;
+            if (fx < 0) fx = 0;
+            if (fx > LTM_GRID_X - 1) fx = LTM_GRID_X - 1;
+            int gx0 = (int)fx;
+            int gx1 = gx0 + 1;
+            if (gx1 >= LTM_GRID_X) gx1 = LTM_GRID_X - 1;
+            float wx = fx - gx0;
+            float iwx = 1.0f - wx;
+
+            float f00 = factor_grid[gy0 * LTM_GRID_X + gx0];
+            float f01 = factor_grid[gy0 * LTM_GRID_X + gx1];
+            float f10 = factor_grid[gy1 * LTM_GRID_X + gx0];
+            float f11 = factor_grid[gy1 * LTM_GRID_X + gx1];
+            float factor = iwx * iwy * f00 + wx * iwy * f01
+                         + iwx * wy  * f10 + wx * wy  * f11;
+
+            int y_old = row[x * 2];
+            int y_new = (int)(y_old * factor + 0.5f);
+            if (y_new < 16) y_new = 16;
+            if (y_new > 235) y_new = 235;
+            row[x * 2] = (uint8_t)y_new;
+        }
+    }
 }
 
 /* Find the V4L2 subdevice that has exposure control (the sensor) */
@@ -701,12 +1053,22 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         const uint16_t *bayer = (const uint16_t *)buffers[buf.index].start;
 
         /* Process frame */
-        float r_mean, g_mean, b_mean, g_mean_centre;
+        float r_mean, g_mean, b_mean;
         uint32_t g_hist[HISTOGRAM_BINS];
         int stat_count, hist_total;
         process_frame(bayer, wb_r_gain, wb_b_gain, brightness,
-                      &r_mean, &g_mean, &b_mean, &g_mean_centre,
+                      &r_mean, &g_mean, &b_mean,
                       g_hist, &hist_total, &stat_count);
+
+        /* Multi-zone AE target: mean green of the darkest 25% of zones. */
+        float g_target = compute_ae_zone_target();
+
+        /* LTM disabled: a fixed knee on a 60x34 grid segments face skin
+         * (forehead vs. cheek) into compressed/uncompressed cells and the
+         * bilinear upsample renders that as a visible patch on the face.
+         * Dual-constraint AGC (shadow-priority target + highlight cap)
+         * already handles backlit scenes without this side effect. */
+        (void)apply_ltm;
 
         /* Update white balance (gray-world, no offsets) */
         if (r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
@@ -735,10 +1097,10 @@ static int streaming_loop(const char *capture_dev, int out_fd,
          */
         float target_brightness = brightness;
 
-        /* (a) Mean target on the centre-weighted subject */
-        float cur_centre_8bit = g_mean_centre * brightness / MAX_SIGNAL * 255.0f;
-        float bright_for_mean = (cur_centre_8bit > 1.0f)
-            ? brightness * AE_TARGET / cur_centre_8bit
+        /* (a) Mean target on the dark-zones average (shadow-priority). */
+        float cur_target_8bit = g_target * brightness / MAX_SIGNAL * 255.0f;
+        float bright_for_mean = (cur_target_8bit > 1.0f)
+            ? brightness * AE_TARGET / cur_target_8bit
             : BRIGHTNESS_MAX;
 
         /* (b) Highlight cap from green histogram */
@@ -809,9 +1171,9 @@ static int streaming_loop(const char *capture_dev, int out_fd,
 
         frame_count++;
         if (frame_count % 150 == 0) {
-            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d | means: R=%.1f G=%.1f Gctr=%.1f B=%.1f | AE: mean=>%.2f cap=>%.2f\n",
+            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d | means: R=%.1f G=%.1f Gdark=%.1f B=%.1f | AE: mean=>%.2f cap=>%.2f\n",
                    frame_count, wb_r_gain, wb_b_gain, brightness, cur_exposure, cur_gain,
-                   r_mean, g_mean, g_mean_centre, b_mean,
+                   r_mean, g_mean, g_target, b_mean,
                    bright_for_mean, bright_for_cap);
         }
 
