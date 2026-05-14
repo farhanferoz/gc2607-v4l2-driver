@@ -52,12 +52,39 @@
 #define WB_SMOOTHING    0.85f   /* Temporal smoothing (higher = more stable) */
 #define WB_SUBSAMPLE    8       /* Sample every Nth pixel for WB stats */
 
-/* Auto exposure */
-#define AE_TARGET       100.0f  /* Target mean brightness (0-255 scale) */
-#define AE_SMOOTHING    0.92f   /* Temporal smoothing for brightness */
-#define AE_INTERVAL_S   1.5     /* Hardware AE adjustment interval */
-#define BRIGHTNESS_MIN  0.5f
-#define BRIGHTNESS_MAX  3.5f
+/*
+ * Auto exposure — dual-constraint AGC (libcamera AgcMeanLuminance pattern).
+ *
+ * Each frame computes two independent brightness targets and takes the
+ * smaller (= more restrictive). This is the production-standard approach
+ * used on Raspberry Pi / IPU3 — a plain mean target alone cannot tell
+ * "few clipped pixels" from "lots of clipped pixels", which is why bright
+ * scenes with white walls blow out even when the mean lands on target.
+ *
+ *  1. Mean target (centre-weighted): aim for AE_TARGET on the subject area.
+ *  2. Highlight cap: the AE_HIGHLIGHT_PCTILE percentile of green must stay
+ *     at or below AE_HIGHLIGHT_CAP in 8-bit output. Walls/ceiling can no
+ *     longer pin at 255.
+ */
+#define AE_TARGET           100.0f  /* mean (0-255) for centre-weighted subject */
+#define AE_HIGHLIGHT_PCTILE 0.98f   /* upper 2% of pixels are the "highlight" set */
+#define AE_HIGHLIGHT_CAP    220.0f  /* their value must not exceed this (0-255) */
+#define AE_SMOOTHING        0.92f   /* temporal smoothing */
+#define AE_INTERVAL_S       1.5     /* hardware AE adjustment interval */
+#define BRIGHTNESS_MIN      0.5f
+#define BRIGHTNESS_MAX      3.5f
+
+/* Green-channel histogram for highlight detection: 1024/64 = 16 raw per bin. */
+#define HISTOGRAM_BINS      64
+#define HIST_BIN_WIDTH      (LUT_SIZE / HISTOGRAM_BINS)  /* = 16 */
+
+/* Centre region for AE mean (typical webcam framing: subject middle of frame).
+ * Centre pixels weighted 2x in the green mean; edges 1x. Boundaries in OUTPUT
+ * coordinates (0..OUT_W, 0..OUT_H). */
+#define CENTRE_X_LO   (OUT_W * 25 / 100)   /* 25% to 75% horizontally */
+#define CENTRE_X_HI   (OUT_W * 75 / 100)
+#define CENTRE_Y_LO   (OUT_H * 15 / 100)   /* 15% to 85% vertically */
+#define CENTRE_Y_HI   (OUT_H * 85 / 100)
 
 /* Sensor hardware limits */
 #define EXPOSURE_MIN    4
@@ -182,13 +209,18 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
  */
 static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
                            float brightness, float *out_r_sum, float *out_g_sum,
-                           float *out_b_sum, int *out_count)
+                           float *out_b_sum, float *out_g_mean_centre,
+                           uint32_t *out_g_hist, int *out_hist_total,
+                           int *out_count)
 {
     /* Green gain is always 1.0 in gray-world WB */
     build_luts(r_gain, 1.0f, b_gain, brightness);
 
     double r_sum = 0, g_sum = 0, b_sum = 0;
+    double g_sum_centre = 0, weight_total = 0;
     int stat_count = 0;
+    int hist_total = 0;
+    for (int i = 0; i < HISTOGRAM_BINS; i++) out_g_hist[i] = 0;
 
     /*
      * Iterate output pixels in reverse for 180 degree rotation.
@@ -241,12 +273,18 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
             /* Swap pixel order within the pair for horizontal flip */
             rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
 
-            /* Accumulate WB statistics (subsampled).
-             * Skip pixels where ANY channel is saturated (>=1020) —
-             * clipped values hide the true channel ratio, causing
-             * AWB to underestimate green dominance in bright scenes.
-             */
+            /* Accumulate WB + AE statistics (subsampled). */
             if ((oy & (WB_SUBSAMPLE - 1)) == 0 && (ox & (WB_SUBSAMPLE - 1)) == 0) {
+                /* Histogram: every sampled pixel including saturated ones —
+                 * the highlight cap explicitly needs to see clipped values. */
+                int hbin = gavg_0 / HIST_BIN_WIDTH;
+                if (hbin >= HISTOGRAM_BINS) hbin = HISTOGRAM_BINS - 1;
+                out_g_hist[hbin]++;
+                hist_total++;
+
+                /* WB / mean stats: skip saturated — clipped values hide the
+                 * true channel ratio, causing AWB to underestimate green
+                 * dominance in bright scenes. */
                 if (r_0 < 1020 && gavg_0 < 1020 && b_0 < 1020) {
                     float rv = (float)r_0 - BLACK_LEVEL;
                     float gv = (float)gavg_0 - BLACK_LEVEL;
@@ -258,15 +296,30 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
                     g_sum += gv;
                     b_sum += bv;
                     stat_count++;
+
+                    /* Centre-weighted green mean for AE — push the subject
+                     * toward AE_TARGET rather than the whole frame, so a
+                     * bright background does not pull the subject dark. */
+                    int in_centre = (out_x >= CENTRE_X_LO && out_x < CENTRE_X_HI
+                                  && out_y >= CENTRE_Y_LO && out_y < CENTRE_Y_HI);
+                    float w = in_centre ? 2.0f : 1.0f;
+                    g_sum_centre += gv * w;
+                    weight_total += w;
                 }
             }
         }
     }
 
-    *out_r_sum = (float)(r_sum / stat_count);
-    *out_g_sum = (float)(g_sum / stat_count);
-    *out_b_sum = (float)(b_sum / stat_count);
+    if (stat_count > 0) {
+        *out_r_sum = (float)(r_sum / stat_count);
+        *out_g_sum = (float)(g_sum / stat_count);
+        *out_b_sum = (float)(b_sum / stat_count);
+    } else {
+        *out_r_sum = *out_g_sum = *out_b_sum = 0.0f;
+    }
+    *out_g_mean_centre = (weight_total > 0) ? (float)(g_sum_centre / weight_total) : *out_g_sum;
     *out_count = stat_count;
+    *out_hist_total = hist_total;
 
     return *out_g_sum;
 }
@@ -648,10 +701,12 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         const uint16_t *bayer = (const uint16_t *)buffers[buf.index].start;
 
         /* Process frame */
-        float r_mean, g_mean, b_mean;
-        int stat_count;
+        float r_mean, g_mean, b_mean, g_mean_centre;
+        uint32_t g_hist[HISTOGRAM_BINS];
+        int stat_count, hist_total;
         process_frame(bayer, wb_r_gain, wb_b_gain, brightness,
-                      &r_mean, &g_mean, &b_mean, &stat_count);
+                      &r_mean, &g_mean, &b_mean, &g_mean_centre,
+                      g_hist, &hist_total, &stat_count);
 
         /* Update white balance (gray-world, no offsets) */
         if (r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
@@ -670,17 +725,43 @@ static int streaming_loop(const char *capture_dev, int out_fd,
             wb_b_gain = sm * wb_b_gain + (1.0f - sm) * new_b_gain;
         }
 
-        /* Auto-exposure: adjust software brightness based on green mean */
-        float cur_brightness_8bit = g_mean * brightness / MAX_SIGNAL * 255.0f;
-        if (cur_brightness_8bit > 1.0f) {
-            float ae_ratio = AE_TARGET / cur_brightness_8bit;
-            brightness = (
-                AE_SMOOTHING * brightness
-                + (1.0f - AE_SMOOTHING) * (brightness * ae_ratio)
-            );
-            if (brightness < BRIGHTNESS_MIN) brightness = BRIGHTNESS_MIN;
-            if (brightness > BRIGHTNESS_MAX) brightness = BRIGHTNESS_MAX;
+        /*
+         * Auto-exposure: dual-constraint AGC.
+         *  (a) Mean target (centre-weighted) keeps the subject around AE_TARGET.
+         *  (b) Highlight cap keeps the AE_HIGHLIGHT_PCTILE percentile of green
+         *      below AE_HIGHLIGHT_CAP — protects bright walls/ceilings from
+         *      saturating, which a mean-only AE cannot detect.
+         * Take the more restrictive (smaller) brightness; smooth temporally.
+         */
+        float target_brightness = brightness;
+
+        /* (a) Mean target on the centre-weighted subject */
+        float cur_centre_8bit = g_mean_centre * brightness / MAX_SIGNAL * 255.0f;
+        float bright_for_mean = (cur_centre_8bit > 1.0f)
+            ? brightness * AE_TARGET / cur_centre_8bit
+            : BRIGHTNESS_MAX;
+
+        /* (b) Highlight cap from green histogram */
+        float bright_for_cap = BRIGHTNESS_MAX;
+        if (hist_total > 0) {
+            int threshold = (int)(hist_total * AE_HIGHLIGHT_PCTILE);
+            int cum = 0;
+            int p_bin = HISTOGRAM_BINS - 1;
+            for (int b = 0; b < HISTOGRAM_BINS; b++) {
+                cum += g_hist[b];
+                if (cum >= threshold) { p_bin = b; break; }
+            }
+            /* Centre of bin in raw 10-bit space */
+            float pctile_raw = (p_bin + 0.5f) * (float)HIST_BIN_WIDTH - BLACK_LEVEL;
+            if (pctile_raw < 1.0f) pctile_raw = 1.0f;
+            bright_for_cap = AE_HIGHLIGHT_CAP * MAX_SIGNAL / (pctile_raw * 255.0f);
         }
+
+        target_brightness = bright_for_mean < bright_for_cap ? bright_for_mean : bright_for_cap;
+
+        brightness = AE_SMOOTHING * brightness + (1.0f - AE_SMOOTHING) * target_brightness;
+        if (brightness < BRIGHTNESS_MIN) brightness = BRIGHTNESS_MIN;
+        if (brightness > BRIGHTNESS_MAX) brightness = BRIGHTNESS_MAX;
 
         /* Hardware AE: adjust sensor exposure/gain when software gain is railing */
         struct timespec now;
@@ -728,9 +809,10 @@ static int streaming_loop(const char *capture_dev, int out_fd,
 
         frame_count++;
         if (frame_count % 150 == 0) {
-            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d | means: R=%.1f G=%.1f B=%.1f\n",
+            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d | means: R=%.1f G=%.1f Gctr=%.1f B=%.1f | AE: mean=>%.2f cap=>%.2f\n",
                    frame_count, wb_r_gain, wb_b_gain, brightness, cur_exposure, cur_gain,
-                   r_mean, g_mean, b_mean);
+                   r_mean, g_mean, g_mean_centre, b_mean,
+                   bright_for_mean, bright_for_cap);
         }
 
         /*
