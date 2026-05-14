@@ -118,6 +118,8 @@ struct gc2607 {
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *gain;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *vblank;
 
 	/* Power management resources (provided by INT3472 PMIC) */
 	struct clk *xclk;		/* Master clock (typically 19.2 MHz) */
@@ -560,11 +562,36 @@ static int gc2607_set_fmt(struct v4l2_subdev *sd,
 	return 0;
 }
 
+/*
+ * V4L2_SEL_TGT_CROP_BOUNDS / _DEFAULT / _CROP — mandatory for libcamera
+ * (see Documentation/driver-api/media/sensor_driver_requirements.rst).
+ * This sensor doesn't support cropping; all three targets return the
+ * full native pixel array.
+ */
+static int gc2607_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *state,
+				struct v4l2_subdev_selection *sel)
+{
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.top = 0;
+		sel->r.left = 0;
+		sel->r.width = GC2607_WIDTH;
+		sel->r.height = GC2607_HEIGHT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct v4l2_subdev_pad_ops gc2607_pad_ops = {
 	.enum_mbus_code = gc2607_enum_mbus_code,
 	.enum_frame_size = gc2607_enum_frame_size,
 	.get_fmt = gc2607_get_fmt,
 	.set_fmt = gc2607_set_fmt,
+	.get_selection = gc2607_get_selection,
 };
 
 /*
@@ -850,7 +877,7 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	/* Initialize control handler with V4L2 controls */
-	v4l2_ctrl_handler_init(&gc2607->ctrls, 4);
+	v4l2_ctrl_handler_init(&gc2607->ctrls, 8);
 
 	/* Link frequency control (required by IPU6) */
 	gc2607->link_freq = v4l2_ctrl_new_int_menu(&gc2607->ctrls,
@@ -890,6 +917,48 @@ static int gc2607_probe(struct i2c_client *client)
 					  GC2607_GAIN_MAX,
 					  GC2607_GAIN_STEP,
 					  GC2607_GAIN_DEFAULT);
+
+	/*
+	 * HBLANK and VBLANK — mandatory under libcamera's sensor driver
+	 * requirements (HBLANK lets libcamera compute line time; VBLANK
+	 * lets it compute frame rate and exposure-vs-frame headroom). Both
+	 * are read-only since this driver currently runs the sensor in a
+	 * single fixed mode (1920x1080 @ HTS=2048, VTS=2003).
+	 */
+	gc2607->hblank = v4l2_ctrl_new_std(&gc2607->ctrls,
+					   &gc2607_ctrl_ops,
+					   V4L2_CID_HBLANK,
+					   GC2607_HTS - GC2607_WIDTH,
+					   GC2607_HTS - GC2607_WIDTH,
+					   1,
+					   GC2607_HTS - GC2607_WIDTH);
+	if (gc2607->hblank)
+		gc2607->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	gc2607->vblank = v4l2_ctrl_new_std(&gc2607->ctrls,
+					   &gc2607_ctrl_ops,
+					   V4L2_CID_VBLANK,
+					   GC2607_VTS - GC2607_HEIGHT,
+					   GC2607_VTS - GC2607_HEIGHT,
+					   1,
+					   GC2607_VTS - GC2607_HEIGHT);
+	if (gc2607->vblank)
+		gc2607->vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	/*
+	 * Parse fwnode (ACPI _DSD / DT) properties for orientation and
+	 * rotation, exposed as V4L2_CID_CAMERA_ORIENTATION and
+	 * V4L2_CID_CAMERA_SENSOR_ROTATION. If the platform doesn't provide
+	 * the properties, the helpers no-op gracefully — keep going.
+	 */
+	{
+		struct v4l2_fwnode_device_properties props;
+
+		if (!v4l2_fwnode_device_parse(dev, &props))
+			v4l2_ctrl_new_fwnode_properties(&gc2607->ctrls,
+							&gc2607_ctrl_ops,
+							&props);
+	}
 
 	gc2607->sd.ctrl_handler = &gc2607->ctrls;
 
