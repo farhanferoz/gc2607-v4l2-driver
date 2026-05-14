@@ -62,3 +62,46 @@ The April hardware-ISP investigation was reopened on F44 with initial optimism �
     3.  GC2607 was never accepted into Intel's IPU6 driver tree — `intel/ipu6-drivers` Issue #272 (Oct 2024) is still open. F44's shipped `gc2607-uf.xml` had its BE SOC pipeline stripped (because the kernel side doesn't exist), and `gc2607-uf` is absent from `availableSensors` in `libcamhal_profile.xml`.
 *   The April framing ("blocked by missing BE SOC bridge") was incomplete — it implied a missing puzzle piece, when the real story is upstream policy. Even with kernel updates, HW ISP would still need (a) GC2607 patches landed in Intel's tree, (b) the proprietary stack actively maintained against the current kernel, and (c) Intel reversing the PSYS-is-proprietary policy.
 *   **Conclusion:** `gc2607_isp.c` software ISP (~4% CPU) is **the only viable path** for this sensor on this laptop — not a workaround, the answer. Full analysis with sources in `docs/native_hal_investigation.md`. Quarterly-check criteria documented there; tracked in `RESUME.md`.
+
+### Phase 12: ISP Image-Quality Work (May 2026)
+
+Iterated on the hand-rolled software ISP to address three real-world problems: white-wall blowout on bright scenes, chroma moiré on textured fabric (corduroy), and dim backlit faces.
+
+Shipped:
+*   **Multi-zone shadow-priority AE** (commit `0a6bdeb`) — 16×16 zone grid metered on the mean of the darkest 25% of zones. Replaces the centre-weighted target that failed when the subject wasn't centred or when the centre contained the bright background. Pattern matches libcamera `AgcMeanLuminance` / RPi IPA. Paired with the pre-existing percentile highlight cap as a dual-constraint AGC.
+*   **Chroma denoise via 3×3 median** on U/V (pre-session, kept). Fixes false colour on flat surfaces.
+
+Abandoned after testing:
+*   **Global tone curves** — ACES Narkowicz, asymmetric hyperbolic knee, half-strength smoothstep. All failed for the same reason: no global luma threshold separates skin highlights from wall highlights at the same Y. Tone mapping for backlit scenes is inherently spatial, not global.
+*   **Local tone mapping (LTM)** — implemented twice. Box-blurred grid produced halos at the silhouette boundary; bilateral-filtered grid fixed the halo but exposed a new artefact (face-internal "patch" on the well-lit forehead where the cell-grid factor jump becomes visible inside skin). Code is preserved in `gc2607_isp.c` but gated off at the call site. Re-enabling with `LTM_KNEE=200` or a highlight-only threshold is one of the future options.
+
+Deferred:
+*   **Malvar-He-Cutler demosaic** (vs current 2×2 binning) — the root cause of corduroy chroma moiré is binning-stage aliasing; chroma median can't unscramble pre-aliased UV. ~150-200 LoC, +2-3% CPU. Open the day someone needs clean fine-pinstripe / sharp screens.
+
+Full session-by-session breakdown of attempts, mechanisms, and pickup options in `docs/research/ISP_IMAGE_QUALITY.md`.
+
+### Phase 13: libcamera Software ISP Path Opened (May 2026)
+
+Investigated whether libcamera's Software ISP (the `simple` pipeline + `soft IPA` added in libcamera 0.3, merged Apr 2024 for IPU6) could replace the hand-rolled daemon. F44 ships libcamera 0.7.1 with the soft IPA module installed (`/usr/lib64/libcamera/ipa/ipa_soft_simple.so`).
+
+Initial probe via `cam --list`: libcamera **did** enumerate the sensor, then refused to instantiate it with `Failed to create sensor: -22 / The sensor kernel driver needs to be fixed`. The driver was missing standard V4L2 sensor controls.
+
+**Phase 1 — V4L2 driver conformance** (commit `aeb1305`). Added to `gc2607.c`:
+*   `V4L2_CID_HBLANK` (read-only) = HTS - WIDTH = 128
+*   `V4L2_CID_VBLANK` (read-only) = VTS - HEIGHT = 923
+*   `get_selection` pad op covering CROP / CROP_DEFAULT / CROP_BOUNDS, returning the full 1920×1080 pixel array (this sensor doesn't crop)
+*   `v4l2_fwnode_device_parse` + `v4l2_ctrl_new_fwnode_properties` populating CAMERA_ORIENTATION and CAMERA_SENSOR_ROTATION when fwnode provides them
+
+Pattern templated from `drivers/media/i2c/gc05a2.c` (same SGRBG10 Bayer order, single source pad, fixed-mode sensor). Confirmed no upstream gc2607 driver exists — neither in mainline kernel, lore patches, Intel ipu6-drivers, nor any OEM tree (`intel/ipu6-drivers` Issue #272 is still open with no PR).
+
+After Phase 1: `cam --list` enumerates the sensor (`Adding camera '\_SB_.PC00.LNK0' for pipeline handler simple`). v4l2-ctl --list-ctrls on the subdev shows all the new controls live.
+
+**Phase 2 — end-to-end streaming verified** (commit `042911a`). `cam -c 1 -C60 -F frame-#.ppm` streams 60 frames at 1920×1080 / 16 fps. Soft IPA's grey-world AWB has converged by ~frame 30. Image quality at frame 60 is roughly comparable to `gc2607_isp.c` — slightly weaker WB, similar exposure in backlit scenes, much better resolution. Reproducible via `sudo gc2607-libcamera-snap.sh`.
+
+**Phase 3 — quality parity (in progress, mostly open):**
+*   **Open: rotation.** Sensor mounted upside-down on this MateBook; ACPI _DSD doesn't carry rotation. Driver-side override attempts (`v4l2_ctrl_new_std(CAMERA_SENSOR_ROTATION, 180, ...)`; modifying `props.rotation` before `v4l2_ctrl_new_fwnode_properties`) both failed — control stayed at min=max=0, debug `dev_warn` calls inside the override block didn't appear in dmesg despite being present in the .ko string table. Mechanism not understood. Workaround: ffmpeg post-rotate after capture. Real fix is likely libcamera-side (an entry in `CameraSensorProperties` database) which requires rebuilding libcamera.
+*   **Open: `CameraSensorHelperGc2607`.** Soft IPA logs "Failed to create camera sensor helper for gc2607" → AGC operates with reduced/wrong gain range. Fix: ~30-LoC C++ class in `src/ipa/libipa/camera_sensor_helper.cpp` mapping our 17-entry analogue-gain LUT to actual gain values. Requires rebuilding libcamera.
+*   **Open: tuned `gc2607.yaml`.** Currently falls back to `uncalibrated.yaml`. A tuned config with CCM + gamma + black-level values would close the colour-accuracy gap.
+*   **Open: lazy activation / suspend interop on the libcamera path.** Our daemon's strengths; PipeWire has a different model.
+
+**Status at session end:** Software ISP via libcamera is a *reachable* path, not yet a *better* one. The hand-rolled `gc2607_isp.c` daemon remains the shipped pipeline. Phase 3 is upstream-style C++ work in libcamera that would close the gap. Quarterly check criteria for revisiting: a `gc2607.yaml` ships upstream, or someone writes `CameraSensorHelperGc2607` and lands it in libcamera. See `docs/research/ISP_IMAGE_QUALITY.md` for the full algorithmic context informing this decision.
