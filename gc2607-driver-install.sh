@@ -31,9 +31,18 @@ rebind_stack() {
     # If it wasn't loaded, the modprobe -r is a no-op.
     modprobe -r intel_ipu6_isys 2>/dev/null || true
     modprobe -r gc2607 2>/dev/null || true
-    # Now reload in dependency order. modprobe gc2607 binds the i2c
-    # device; modprobe intel_ipu6_isys re-resolves async subdevs.
+    # Now reload in dependency order. modprobe gc2607 only registers
+    # the i2c_driver — matching i2c_clients are auto-bound by the bus,
+    # but on stale state the existing GCTI2607 client may not get a
+    # fresh probe call. Force it via sysfs unbind/bind so any new
+    # control-init code paths actually run.
     modprobe gc2607 || return 1
+    if [ -e /sys/bus/i2c/devices/i2c-GCTI2607:00/driver ]; then
+        echo i2c-GCTI2607:00 > /sys/bus/i2c/drivers/gc2607/unbind 2>/dev/null || true
+    fi
+    if [ -e /sys/bus/i2c/devices/i2c-GCTI2607:00 ]; then
+        echo i2c-GCTI2607:00 > /sys/bus/i2c/drivers/gc2607/bind 2>/dev/null || true
+    fi
     modprobe intel_ipu6_isys || return 1
 }
 

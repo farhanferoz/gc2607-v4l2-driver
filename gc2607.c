@@ -949,7 +949,11 @@ static int gc2607_probe(struct i2c_client *client)
 	 * Parse fwnode (ACPI _DSD / DT) properties for orientation and
 	 * rotation, exposed as V4L2_CID_CAMERA_ORIENTATION and
 	 * V4L2_CID_CAMERA_SENSOR_ROTATION. If the platform doesn't provide
-	 * the properties, the helpers no-op gracefully — keep going.
+	 * the properties (Huawei MateBook ACPI doesn't), the helpers
+	 * no-op gracefully — keep going. Driver-side override of the
+	 * rotation control was tried and didn't take effect; downstream
+	 * consumers can apply rotation via libcamera's orientation API
+	 * (`cam -o rot180`) or PipeWire transforms.
 	 */
 	{
 		struct v4l2_fwnode_device_properties props;
