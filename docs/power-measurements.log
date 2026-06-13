@@ -1,0 +1,4 @@
+timestamp,kernel,ac_online,tuned,epp,governor,backlight_pct,window_s,rapl_pkg_w,total_system_w,loadavg1,note
+2026-06-13 10:56:05,7.0.12-201.fc44.x86_64,0,balanced-battery,balance_power,powersave,20,60,6.14,11.21,0.67,idle tuned 7.0.12 balanced-battery
+2026-06-13 11:02:31,7.0.12-201.fc44.x86_64,0,balanced-battery,balance_performance,powersave,20,60,15.94,25.18,1.04,AB-untuned-balance_performance
+2026-06-13 11:03:34,7.0.12-201.fc44.x86_64,0,balanced-battery,balance_power,powersave,20,60,8.89,17.51,1.06,AB-tuned-balance_power
