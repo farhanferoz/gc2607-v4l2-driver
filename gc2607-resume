@@ -1,0 +1,39 @@
+#!/bin/bash
+# Restart gc2607 camera service after system resume from suspend.
+#
+# Needed because Conflicts=sleep.target stops the camera service when
+# the system suspends and does not bring it back. This hook is invoked
+# by systemd-suspend.service with "$1 = post" after wake.
+#
+# Install:
+#   sudo install -m 0755 gc2607-resume /usr/lib/systemd/system-sleep/gc2607-resume
+#
+# History:
+#   - First version called `systemctl start` inline → exit 4 because
+#     start of a Conflicts=sleep.target unit is refused while sleep.target
+#     is still active.
+#   - Second version switched to `systemctl restart` with a 1s settle →
+#     fails on every wake with "destructive transaction" because the
+#     hook runs *inside* systemd-suspend.service's post phase, before
+#     sleep.target finishes deactivating. systemd refuses any transaction
+#     that contradicts the still-queued suspend job. Each retry logged
+#     "exit 0" (the inverted `$?` of `! cmd`), masking the real error.
+#   - Current version (this) detaches the restart via `systemd-run
+#     --no-block` so it runs as a fresh transient unit *after* this hook
+#     returns. By then sleep.target is fully deactivated and `start`
+#     succeeds.
+
+case "$1" in
+    post)
+        # Spawn a detached transient unit that waits briefly for
+        # sleep.target to wind down, then starts the camera service.
+        # Running this inline (or even backgrounded with &) would still
+        # be scoped to systemd-suspend.service and race the suspend
+        # transaction; systemd-run breaks the parent-unit relationship.
+        if ! systemd-run --no-block --collect \
+                /bin/sh -c 'sleep 2; systemctl start gc2607-camera.service'; then
+            logger -t gc2607-resume "systemd-run failed to schedule camera restart"
+            exit 1
+        fi
+        ;;
+esac

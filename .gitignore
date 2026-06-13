@@ -1,0 +1,26 @@
+# Kernel module build artifacts (out-of-tree builds)
+*.o
+*.ko
+*.ko.xz
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Compiled userspace ISP binary (built from gc2607_isp.c)
+/gc2607_isp
+
+# AI assistant instruction/config — local-only, never commit
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+.claudesignore
+.cursorrules
+.clinerules
+.qwen/
+
+# Local environment
+.python-path
