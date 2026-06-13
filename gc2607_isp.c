@@ -65,12 +65,13 @@
  *     darkest zones. Backlit face gets exposed; bright window/wall doesn't
  *     drag exposure down.
  *  2. Highlight cap: the AE_HIGHLIGHT_PCTILE percentile of green must stay
- *     at or below AE_HIGHLIGHT_CAP — kept very loose because LTM (below)
- *     handles bright regions in display space.
+ *     at or below AE_HIGHLIGHT_CAP — this is now the *only* line of
+ *     defence against wall blowout (LTM is permanently disabled — see
+ *     main loop) so the cap is held tight.
  */
 #define AE_TARGET           100.0f  /* mean (0-255) for the dark-zones target */
 #define AE_HIGHLIGHT_PCTILE 0.98f
-#define AE_HIGHLIGHT_CAP    240.0f  /* protect walls from clipping (LTM disabled — see main loop) */
+#define AE_HIGHLIGHT_CAP    220.0f  /* 98th-pctile green ceiling — sole defence against wall blowout */
 #define AE_SMOOTHING        0.92f
 #define AE_INTERVAL_S       1.5
 #define BRIGHTNESS_MIN      0.5f
