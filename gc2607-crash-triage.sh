@@ -114,9 +114,40 @@ for u in nvme-temp-watch journal-capture-nas; do
     echo "$u: $(runuser -u "$NAS_USER" -- env XDG_RUNTIME_DIR=/run/user/$(id -u "$NAS_USER") systemctl --user is-active $u 2>&1)"
 done
 
+# --- 8.5 crash class: userspace-hang vs silent-freeze --------------------
+# A genuine silent freeze is a total SoC wedge: logging stops INSTANTLY, no
+# degradation, no OOM, NMI watchdog never fires. A userspace hang (e.g. a dev
+# build/app exhausting memory) looks the opposite and must NOT be counted as a
+# freeze. We mined a 7-min event as "silent-freeze" once when it was really a
+# StratSense global-OOM + stuck Docker container (2026-06-14) -- this catches it.
+# Search BOTH the local boot journal and the NAS raw window (same events; the
+# local journal may hold a few extra seconds past the NAS gap).
+echo "--- crash class discriminators (userspace-hang vs silent-freeze) ---"
+ALLSRC() { { j -o short-precise; cat "$EV/nas-window-raw.txt" 2>/dev/null; }; }
+SRC_OOM=$(ALLSRC | grep -iE 'oom-kill|out of memory|invoked oom-killer|killed process [0-9]' | tail -5)
+SRC_SLOW=$(ALLSRC | grep -iE 'your system is too slow|expiry is in the past|lagging behind' | tail -3)
+SRC_DOCK=$(ALLSRC | grep -iE 'could not send kill signal' | tail -3)
+PEAK_LOAD=$(grep -oE 'load=[0-9]+\.[0-9]+' "$EV/nas-window-raw.txt" 2>/dev/null | sed 's/load=//' | sort -gr | head -1)
+
+report_marker() { # $1=label  $2=hits
+    if [ -n "$2" ]; then echo "$1: FOUND"; echo "$2" | sed 's/^/    /'; else echo "$1: not found"; fi
+}
+report_marker "OOM kill        " "$SRC_OOM"
+report_marker "user 'too slow' " "$SRC_SLOW"
+report_marker "stuck container " "$SRC_DOCK"
+echo "peak telemetry load= ${PEAK_LOAD:-unknown}  (info only - training legitimately runs high here, so load alone is NOT a hang)"
+
+CLASS="SILENT-FREEZE  (no userspace-hang markers - instant silence, the real signature)"
+if [ -n "$SRC_OOM" ]; then
+    CLASS="USERSPACE-HANG  (global OOM / memory exhaustion -> NOT a silent freeze; EXCLUDE from dataset)"
+elif [ -n "$SRC_SLOW" ] || [ -n "$SRC_DOCK" ]; then
+    CLASS="LIKELY USERSPACE-HANG  (overload markers: 'system too slow'/stuck container -> review before counting)"
+fi
+
 # --- 9. verdict -----------------------------------------------------------
 echo
 echo "================= VERDICT ================="
+echo "CLASSIFICATION    : $CLASS"
 echo "local journal end : $CRASH_END"
 echo "NAS stream end    : ${NAS_END:-unknown}"
 if [ -n "${NAS_END:-}" ] && [ -n "$CRASH_END" ]; then
@@ -127,6 +158,7 @@ if [ -n "${NAS_END:-}" ] && [ -n "$CRASH_END" ]; then
     else
         echo "DIRECTION: SIMULTANEOUS"
     fi
+    [ "${CLASS#SILENT-FREEZE}" = "$CLASS" ] && echo "  (DIRECTION is only meaningful for a true freeze - see CLASSIFICATION above)"
 fi
 echo "pstore records    : $(ls /sys/fs/pstore/ /var/lib/systemd/pstore/ 2>/dev/null | grep -vcE '^$|:')"
 echo "evidence pack     : $EV"
