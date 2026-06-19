@@ -60,26 +60,37 @@ The `gc2607-camera.service` lifecycle is controlled by **two** coordinated piece
 - **Format limits**: The kernel uses Linux standard coding style for C.
 - **Dependencies**: The ISP must remain pure executable C requiring no external interpretation (Do not use Python/NumPy for camera streaming due to excessive overhead).
 
-## Hardware ISP / Native HAL Stack Status (CLOSED — INFEASIBLE — May 2026)
+## Hardware ISP / Native HAL Stack Status (CLOSED — INFEASIBLE — re-checked 2026-06-19)
 
-The IPU6 hardware ISP path is **dead-end on this hardware/sensor** as of May 2026. Three
-independent blockers, any one fatal:
-1. **Mainline kernel has no PSYS module** (the HW ISP doing Bayer→NV12). Intel considers
-   PSYS firmware/algorithms proprietary and **will not upstream it**. Mainline 6.10+ has
-   only ISYS (raw CSI receiver).
-2. **Out-of-tree proprietary stack is unmaintained.** RPMFusion `akmod-intel-ipu6` and
-   Intel's `intel/ipu6-drivers` repo stopped tracking kernel API changes around v6.16
-   (Dec 2024 / Jan 2025). F44 ships kernel ≥6.17.
-3. **GC2607 was never accepted into Intel's IPU6 driver tree.**
-   [Issue #272](https://github.com/intel/ipu6-drivers/issues/272) (Oct 2024) is still
-   open with no progress. F44's shipped `gc2607-uf.xml` HAL config has the BE SOC pipeline
-   stripped (because the kernel side doesn't exist) and `gc2607-uf` is absent from
-   `availableSensors` in `libcamhal_profile.xml`.
+The IPU6 hardware ISP path is still **dead-end for this sensor**, but the *reason* has
+narrowed since the original May-2026 assessment. Two of the three original blockers have
+softened; one decisive blocker remains (verified on-device 2026-06-19).
 
-**Conclusion:** The custom `gc2607_isp.c` software ISP (~4% CPU) is **the only viable path**
-for this sensor on this laptop. It is not a workaround — it is the answer. See
-`docs/native_hal_investigation.md` for full analysis and quarterly-check criteria for
-reopening if upstream policy changes.
+1. ~~Mainline kernel has no PSYS module~~ **PSYS is actually PRESENT on this machine.**
+   Mainline still ships only ISYS, but we run RPMFusion's out-of-tree `akmod-intel-ipu6`,
+   which *includes* the PSYS driver (the HW ISP doing Bayer→NV12). Verified: `kmod-intel-ipu6-7.0.12-201`
+   built for the running kernel and `intel_ipu6_psys` is loaded (`lsmod`). So "mainline has
+   no PSYS" is true for *mainline* but is **not** why the HW ISP is unavailable here.
+2. ~~Out-of-tree stack is unmaintained~~ **Maintained again.** `intel/ipu6-drivers` now
+   carries kernel-7.0 patches (June 2026) and the RPMFusion akmod builds + loads on F44's
+   kernel 7.0.12 (package source is pinned to a 2025-09-09 snapshot, but it builds). The
+   "stopped tracking kernel API at v6.16" claim is outdated.
+3. **DECISIVE BLOCKER — GC2607 has zero HAL/libcamera support and no proprietary tuning.**
+   [Issue #272](https://github.com/intel/ipu6-drivers/issues/272) (Oct 2024) is still open,
+   no maintainer action since Jan 2026. In the installed `ipu6-camera-hal`: gc2607 is absent
+   from every `availableSensors` list (ipu6 / ipu6ep / **ipu6epmtl** = the Meteor Lake
+   profile); **no `gc2607*.xml` sensor config ships at all** (not even a stripped one); and
+   **no `gc2607*.aiqb` tuning binary exists** (shipped tunings are hm11b1/ov01a1s/ar0234/
+   imx390/…). The IPU6 HW ISP cannot process gc2607 frames without that per-sensor `.aiqb`
+   AIQ tuning, which only Intel produces and has never released for gc2607. libcamera has no
+   gc2607 `CameraSensorHelper` either.
+
+**Conclusion (unchanged):** The custom `gc2607_isp.c` software ISP (~4% CPU) remains **the
+only viable path**. Even with PSYS loaded, the missing gc2607 `.aiqb` tuning + HAL/libcamera
+entry is fatal. The realistic future path is upstream — add a gc2607 `CameraSensorHelper` to
+libcamera and ride its maturing software ISP (same *category* as the current solution), NOT
+the IPU6 hardware ISP. See `docs/native_hal_investigation.md` for full analysis and
+quarterly-check criteria for reopening if upstream policy changes.
 
 ## Fedora 44 Setup Notes (post-upgrade)
 
