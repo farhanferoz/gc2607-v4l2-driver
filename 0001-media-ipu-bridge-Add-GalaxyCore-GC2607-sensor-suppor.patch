@@ -1,0 +1,34 @@
+From 99343fd33f49803ed9ee4dd569359684fd4dc0b2 Mon Sep 17 00:00:00 2001
+From: ff235 <ff235@users.noreply.github.com>
+Date: Mon, 23 Mar 2026 11:38:19 +0000
+Subject: [PATCH] media: ipu-bridge: Add GalaxyCore GC2607 sensor support
+
+Add the GalaxyCore GC2607 (ACPI HID GCTI2607) to the list of sensors
+supported by the IPU bridge driver. This 2MP sensor is found in the
+Huawei MateBook X Pro 2024 (VGHH-XX) connected to an Intel Meteor Lake
+IPU6 via MIPI CSI-2 at a link frequency of 336 MHz.
+
+Without this entry the IPU bridge does not create the required software
+nodes for the sensor, so the camera is not usable on these laptops.
+
+Signed-off-by: ff235 <ff235@users.noreply.github.com>
+---
+ drivers/media/pci/intel/ipu-bridge.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/media/pci/intel/ipu-bridge.c b/drivers/media/pci/intel/ipu-bridge.c
+index b2b7100..8231334 100644
+--- a/drivers/media/pci/intel/ipu-bridge.c
++++ b/drivers/media/pci/intel/ipu-bridge.c
+@@ -49,6 +49,8 @@
+  * Please keep the list sorted by ACPI HID.
+  */
+ static const struct ipu_sensor_config ipu_supported_sensors[] = {
++	/* GalaxyCore GC2607 */
++	IPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),
+ 	/* Himax HM11B1 */
+ 	IPU_SENSOR_CONFIG("HIMX11B1", 1, 384000000),
+ 	/* Himax HM2170 */
+-- 
+2.53.0
+

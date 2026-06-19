@@ -18,11 +18,13 @@ live state: `RESUME.md`.
 | Script | What it does | Run |
 |---|---|---|
 | `gc2607-health.sh` | Read-only health check: freeze fix engaged, camera up, power state, no crash last boot. Run anytime. | `bash gc2607-health.sh` |
+| `gc2607-power-status.sh` | Read-only power/thermal **posture audit + verdict** (EPP, turbo headroom, tuned, charge cap, intel_lpmd, radios, PSR, freeze fix) — flags any drift from the tuned baseline. `perf` mode measures the EPP=power CPU cost vs `balance_performance`. Run after reboot/kernel-update/suspend. | `bash gc2607-power-status.sh [perf]` |
 | `gc2607-power-measure.sh` | Measure power draw; logs each run to `docs/power-measurements.log` for comparison. **Unplug first** for the real number. | `sudo bash gc2607-power-measure.sh [secs] [note]` |
 | `gc2607-power-ab.sh` | Controlled back-to-back A/B of the EPP lever at constant load (untuned vs tuned), on battery. | `sudo bash gc2607-power-ab.sh [secs]` |
 | `gc2607-kernel-cleanup.sh` | Remove one installed kernel (RPMs + boot entry + modules). Refuses the running/default kernel. | `sudo bash gc2607-kernel-cleanup.sh <version>` |
 | `gc2607-fix-bridge.sh` | Build/install the patched `ipu-bridge.ko` into a kernel's `extra/` (+ hot-swap if it's running). | `sudo bash gc2607-fix-bridge.sh <kver> <ipu-bridge.ko>` |
-| `gc2607-cstate-test.sh` (in `/usr/local/sbin`) | The live freeze-fix controller: `status` / `test1b` / `protect-now` (emergency global C6-off). | `sudo /usr/local/sbin/gc2607-cstate-test.sh status` |
+| `gc2607-cstate-test.sh` (in `/usr/local/sbin`) | C-state controller: `status` / `stock` (full deep sleep, the current baseline) / `test1b` (retired 06-18) / `protect-now` (emergency global C6-off). Boot service **disabled** since the C-state theory was retired. | `sudo /usr/local/sbin/gc2607-cstate-test.sh status` |
+| `gc2607-cstate-clear.sh` | One-shot that retired `test1b`: re-enabled deep sleep on all cores, disabled the boot service, logged a `BASELINE-CHANGE` marker to the NAS stream. Idempotent/reversible. | `sudo bash gc2607-cstate-clear.sh` |
 | `gc2607-idle-cool.sh` | Comfort: bias HWP to low idle frequency (quiet/cool) without touching the C6 fix. `on`/`max`/`off`. | `sudo bash gc2607-idle-cool.sh on` |
 | `gc2607-telemetry.sh` | 2 s per-core C6 + GPU-IRQ telemetry → journal → NAS (freeze forensics; retire once cure is trusted). | user service `gc2607-telemetry.service` |
 | `gc2607-finalize.sh` | (Historical) the one-shot 7.0.11→7.0.12 migration + battery tuning. Kept for reference/re-run. | `sudo bash gc2607-finalize.sh` |

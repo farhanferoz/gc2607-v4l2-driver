@@ -75,5 +75,45 @@ case "${1:-status}" in
     echo ">> idle-cool OFF: restoring default performance bias"
     set_epp "$EPP_DEFAULT"; set_turbo 0; echo; show_status ;;
   status) show_status ;;
-  *) echo "usage: $0 [on|max|off|status]" >&2; exit 1 ;;
+  install)
+    # persist EPP=power across boot + resume + AC<->battery switch. systemd/udev can't
+    # exec a script from /home under SELinux (203/EXEC) -> use a /usr/local/sbin helper.
+    cat > /usr/local/sbin/gc2607-epp-power <<'HELP'
+#!/bin/bash
+# bias all cores to EPP=power (low idle heat; turbo still ramps for real load)
+for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+  [ -w "$f" ] && echo power > "$f"
+done
+exit 0
+HELP
+    chmod +x /usr/local/sbin/gc2607-epp-power
+    command -v restorecon >/dev/null 2>&1 && restorecon -F /usr/local/sbin/gc2607-epp-power 2>/dev/null
+    cat > /etc/systemd/system/gc2607-idle-cool.service <<'SVCEOF'
+[Unit]
+Description=gc2607 idle-cool (EPP=power) - low idle heat, turbo kept for load
+After=tuned.service
+Wants=tuned.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gc2607-epp-power
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    cat > /usr/lib/systemd/system-sleep/gc2607-idle-cool <<'HOOKEOF'
+#!/bin/bash
+[ "$1" = post ] && /usr/local/sbin/gc2607-epp-power
+exit 0
+HOOKEOF
+    chmod +x /usr/lib/systemd/system-sleep/gc2607-idle-cool
+    printf '%s\n' 'SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block restart gc2607-idle-cool.service"' > /etc/udev/rules.d/99-gc2607-idle-cool.rules
+    systemctl daemon-reload; systemctl enable --now gc2607-idle-cool.service; udevadm control --reload
+    echo ">> persisted via /usr/local/sbin/gc2607-epp-power: boot svc (after tuned) + resume hook + AC-change udev rule" ;;
+  uninstall)
+    rm -f /etc/systemd/system/gc2607-idle-cool.service /usr/lib/systemd/system-sleep/gc2607-idle-cool /etc/udev/rules.d/99-gc2607-idle-cool.rules /usr/local/sbin/gc2607-epp-power
+    systemctl disable gc2607-idle-cool.service 2>/dev/null; systemctl daemon-reload; udevadm control --reload 2>/dev/null
+    echo ">> idle-cool persistence removed (runtime EPP unchanged; run 'off' to restore default)" ;;
+  *) echo "usage: $0 [on|max|off|status|install|uninstall]" >&2; exit 1 ;;
 esac

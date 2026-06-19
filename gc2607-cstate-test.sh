@@ -24,6 +24,7 @@
 #   gc2607-cstate-test.sh test1        # apply the Phase-1 config live (cpu2 awake)
 #   gc2607-cstate-test.sh test1b       # apply the Phase-1b config live (LP-E 20/21 off)
 #   gc2607-cstate-test.sh protect-now  # live global C6-off (emergency revert)
+#   gc2607-cstate-test.sh stock        # retire experiments: full deep sleep on ALL cores, marker->off
 #   gc2607-cstate-test.sh status
 #
 set -u
@@ -50,6 +51,11 @@ set_deep() {
 }
 
 global_off() { local c; for c in $(cpus); do set_deep "$c" 1; done; }
+
+# Retire every experiment: re-enable C6/C10 (deep sleep) on EVERY core = stock
+# kernel idle. Used when an experiment is over (e.g. test1b cleared 2026-06-18
+# after the SN740 ASPM-L1 fix held); deep sleep itself was exonerated (crash #18).
+restore_all() { local c; for c in $(cpus); do set_deep "$c" 0; done; }
 
 apply_test1() {
   global_off                                    # safe baseline FIRST
@@ -97,6 +103,9 @@ apply_auto() {
   local mode=test1
   [ -r "$MODE_FILE" ] && mode=$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null)
   case "$mode" in
+    off|stock|none)
+      logger -t "$TAG" "boot mode=STOCK (cmdline cap absent, $MODE_FILE=$mode): full deep sleep, no experiment"
+      restore_all ;;
     test1b)
       logger -t "$TAG" "boot mode=TEST1B (cmdline cap absent, $MODE_FILE=test1b)"
       apply_test1b ;;
@@ -129,6 +138,7 @@ case "${1:-status}" in
   test1)        apply_test1; echo; status ;;
   test1b)       apply_test1b; echo; status ;;
   protect-now)  global_off; logger -t "$TAG" "protect-now: live global C6-off"; echo "global C6-off applied"; echo; status ;;
+  stock)        restore_all; echo off > "$MODE_FILE" 2>/dev/null || true; logger -t "$TAG" "stock: live full deep sleep (C6/C10 re-enabled on ALL cores); marker -> off"; echo "stock (full deep sleep) applied; marker=off"; echo; status ;;
   status)       status ;;
-  *) echo "usage: $0 [apply|test1|test1b|protect-now|status]" >&2; exit 1 ;;
+  *) echo "usage: $0 [apply|test1|test1b|protect-now|stock|status]" >&2; exit 1 ;;
 esac

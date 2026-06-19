@@ -100,4 +100,7 @@ After Fedora 43 → 44, four regressions were identified and fixed (see
 - **Module xz compression**: Fedora's kernel module loader expects `xz --check=crc32`. Default xz uses CRC64 which causes `decompression failed with status 6`.
 - **Format mismatch**: Video device must use `pixelformat=BA10` (not `GB10`) to match sensor's GRBG Bayer pattern.
 - **Reset sequence**: Reset GPIO must end de-asserted (HIGH) or sensor won't respond to I2C.
-- **PipeWire / Wireplumber**: A specific wireplumber rule hides raw IPU6 nodes (`~/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf`). Without this, apps try to use raw IPU6 streams instead of the virtual camera. Must restart wireplumber after v4l2loopback loads.
+- **PipeWire / Wireplumber**: Two wireplumber drop-ins must be in place:
+  - `~/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf` — hides raw IPU6 nodes. Without this, apps try to use raw IPU6 streams instead of the virtual camera.
+  - `~/.config/wireplumber/wireplumber.conf.d/51-disable-libcamera-gc2607.conf` — disables WP's libcamera monitor component entirely. Required because libcamera autodiscovers the gc2607 subdev via its "simple" pipeline handler but has **no `CameraSensorHelper` for `gc2607` in its sensor DB** — the soft IPA fails on close and crashes the kernel in `subdev_close+0x2a` (oops observed 2026-05-14). Until a `CameraSensorHelperGc2607` lands upstream (see `docs/archive/PROJECT_HISTORY.md` Phase 13–14), this component must stay disabled. The per-device `monitor.libcamera.rules` approach did not fire in WP 0.5.14 — component-disable is what's deployed.
+  - Restart wireplumber after `v4l2loopback` loads.

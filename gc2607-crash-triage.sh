@@ -123,7 +123,13 @@ done
 # Search BOTH the local boot journal and the NAS raw window (same events; the
 # local journal may hold a few extra seconds past the NAS gap).
 echo "--- crash class discriminators (userspace-hang vs silent-freeze) ---"
-ALLSRC() { { j -o short-precise; cat "$EV/nas-window-raw.txt" 2>/dev/null; }; }
+# Only weigh markers in the ~20 min BEFORE death. A real OOM/overload hang fires its
+# markers AT the hang; an unrelated boot-time blip must not flip the verdict.
+# (2026-06-15: a libinput "system too slow" at boot - 75 min before a genuine freeze -
+#  wrongly tipped the class to USERSPACE-HANG, which would UNDERCOUNT a real freeze.
+#  The NAS raw window is already hour-bounded; this bounds the local journal to match.)
+CWIN_START=$(date -d "@$(( $(date -d "${CRASH_END:-}" +%s 2>/dev/null || echo 0) - 1200 ))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+ALLSRC() { { j -o short-precise ${CWIN_START:+--since "$CWIN_START"}; cat "$EV/nas-window-raw.txt" 2>/dev/null; }; }
 SRC_OOM=$(ALLSRC | grep -iE 'oom-kill|out of memory|invoked oom-killer|killed process [0-9]' | tail -5)
 SRC_SLOW=$(ALLSRC | grep -iE 'your system is too slow|expiry is in the past|lagging behind' | tail -3)
 SRC_DOCK=$(ALLSRC | grep -iE 'could not send kill signal' | tail -3)
