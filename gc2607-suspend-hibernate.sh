@@ -27,8 +27,11 @@
 #
 set -e
 CMD="${1:-status}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLEEP_D=/etc/systemd/sleep.conf.d/90-gc2607-hibernate.conf
 LOGIN_D=/etc/systemd/logind.conf.d/90-gc2607-hibernate.conf
+HOOK_SRC="$SCRIPT_DIR/gc2607-resume"
+HOOK_DST=/usr/lib/systemd/system-sleep/gc2607-resume
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo "Needs root: sudo bash $0 $*"; exit 1; }; }
 ram_kb(){ awk '/MemTotal/{print $2}' /proc/meminfo; }
@@ -106,5 +109,67 @@ EOF
     systemctl hibernate
     ;;
 
-  *) echo "usage: sudo bash $0 {status|install [DELAY]|uninstall|test}"; exit 2 ;;
+  diag)
+    # Root-only ground truth for hibernate health. Read-only; NEVER sleeps.
+    need_root "$@"
+    echo "===== gc2607 hibernate DIAG (read-only) ====="
+    precheck
+    echo "--- drop-ins (as root) ---"
+    for f in "$SLEEP_D" "$LOGIN_D"; do [ -f "$f" ] && { echo "  PRESENT $f"; sed 's/^/      /' "$f"; } || echo "  MISSING $f"; done
+    echo "--- effective [Sleep] config systemd will use at hibernate time ---"
+    systemd-analyze cat-config systemd/sleep.conf 2>/dev/null | grep -iE 'HibernateDelaySec|HibernateMode|HibernateState' | grep -v '^#' || echo "  (none set -> battery-estimated delay: may never fire on this ~2.2 W board)"
+    echo "--- resume hook installed? ---"
+    if [ -f "$HOOK_DST" ]; then
+      cmp -s "$HOOK_SRC" "$HOOK_DST" 2>/dev/null && echo "  UP-TO-DATE $HOOK_DST" || echo "  STALE      $HOOK_DST  (differs from repo gc2607-resume — run: repair)"
+    else echo "  MISSING    $HOOK_DST  (camera won't restart on resume — run: repair)"; fi
+    echo "--- swap headroom: does the image fit RIGHT NOW? ---"
+    awk 'NR>1 && $1 !~ /zram/ {free += $3 - $4} END{printf "  disk-swap free: %.1f GiB\n", free/1048576}' /proc/swaps
+    awk -v img="$(cat /sys/power/image_size 2>/dev/null)" 'BEGIN{printf "  image_size cap: %.1f GiB (kernel shrinks image toward this; must fit disk-swap free)\n", img/1073741824}'
+    echo "  swapfile nocow (needs 'C'): $(lsattr /var/swap/swapfile 2>/dev/null | awk '{print $1}')"
+    echo "--- last hibernate attempt outcome (journal) ---"
+    journalctl -k --grep 'hibernation|No space left|Image not found' -o short-iso 2>/dev/null | tail -4 || true
+    ;;
+
+  repair)
+    # Live-safe: rewrites config + installs the hardened hook. Triggers NO sleep,
+    # restarts NO daemon (logind lid routing is read live; sleep.conf is read at
+    # sleep time). Fixes: (1) hibernate not firing [HibernateDelaySec], (2) resume
+    # wedge [hardened hook], (3) ENOSPC best-effort [hook caps image_size]. The
+    # swapfile enlargement + the one real hibernate test stay manual (safe window).
+    need_root "$@"
+    DELAY="${2:-90min}"
+    [ -f "$HOOK_SRC" ] || { echo "!! hook source missing: $HOOK_SRC"; exit 1; }
+    mkdir -p "$(dirname "$SLEEP_D")" "$(dirname "$LOGIN_D")"
+    cat > "$SLEEP_D" <<EOF
+# gc2607: roll an unplugged suspend into 0 W hibernate after this long in s2idle.
+# A FIXED delay — without it, systemd battery-estimates and on this ~2.2 W board
+# may never hibernate (observed 2026-07-01: sat in s2idle 3 h, never fired).
+[Sleep]
+HibernateDelaySec=$DELAY
+EOF
+    cat > "$LOGIN_D" <<EOF
+# gc2607: lid-close on battery -> suspend-then-hibernate; on AC -> plain suspend.
+[Login]
+HandleLidSwitch=suspend-then-hibernate
+HandleLidSwitchExternalPower=suspend
+EOF
+    install -m 0755 "$HOOK_SRC" "$HOOK_DST"
+    echo "repaired:"
+    echo "  $SLEEP_D            (HibernateDelaySec=$DELAY)"
+    echo "  $LOGIN_D            (lid routing)"
+    echo "  $HOOK_DST   (image_size ENOSPC guard + gated camera restart)"
+    echo
+    echo "No sleep was triggered and no daemon was restarted."
+    echo "Verify config now:   sudo bash $0 diag"
+    echo
+    echo "STILL NEEDED at a SAFE window (jobs stopped, on AC — NOT now):"
+    echo "  1. Enlarge /var/swap/swapfile so the ~12 GiB image always fits even after"
+    echo "     long uptime (the hook's image_size cap is only best-effort). Needs a"
+    echo "     swapoff/recreate — unsafe under memory pressure."
+    echo "  2. One real cycle:   sudo bash $0 test   (hibernates now; power on to confirm)."
+    echo "  3. Docker/runc can refuse to freeze (stuck container exec / CIFS mount) and"
+    echo "     stall suspend 20 s — stop heavy containers before a lid-close hibernate."
+    ;;
+
+  *) echo "usage: sudo bash $0 {status|diag|install [DELAY]|repair [DELAY]|uninstall|test}"; exit 2 ;;
 esac

@@ -1,39 +1,83 @@
 #!/bin/bash
-# Restart gc2607 camera service after system resume from suspend.
+# gc2607 system-sleep hook: guard hibernation and restart the camera on resume.
 #
-# Needed because Conflicts=sleep.target stops the camera service when
-# the system suspends and does not bring it back. This hook is invoked
-# by systemd-suspend.service with "$1 = post" after wake.
+# systemd calls this as:  gc2607-resume {pre|post} {suspend|hibernate|suspend-then-hibernate|hybrid-sleep}
 #
 # Install:
 #   sudo install -m 0755 gc2607-resume /usr/lib/systemd/system-sleep/gc2607-resume
+#   (gc2607-suspend-hibernate.sh repair does this for you.)
 #
-# History:
-#   - First version called `systemctl start` inline → exit 4 because
-#     start of a Conflicts=sleep.target unit is refused while sleep.target
-#     is still active.
-#   - Second version switched to `systemctl restart` with a 1s settle →
-#     fails on every wake with "destructive transaction" because the
-#     hook runs *inside* systemd-suspend.service's post phase, before
-#     sleep.target finishes deactivating. systemd refuses any transaction
-#     that contradicts the still-queued suspend job. Each retry logged
-#     "exit 0" (the inverted `$?` of `! cmd`), masking the real error.
-#   - Current version (this) detaches the restart via `systemd-run
-#     --no-block` so it runs as a fresh transient unit *after* this hook
-#     returns. By then sleep.target is fully deactivated and `start`
-#     succeeds.
+# It does two jobs:
+#
+# 1. pre + (hibernate|suspend-then-hibernate|hybrid-sleep):
+#    Cap /sys/power/image_size to what the DISK swap actually has free right now,
+#    so the hibernation image is forced to shrink to fit instead of failing the
+#    write with ENOSPC. Root cause seen 2026-07-01: after a long uptime the shared
+#    swapfile (/var/swap/swapfile, prio 0, behind the 8 GiB zram) was consumed by
+#    runtime swap, leaving < the ~12 GiB default image -> "PM: hibernation ... No
+#    space left on device" -> fell back to a half-wedged suspend. Capping the image
+#    to (free disk-swap - MARGIN) is best-effort; a big-enough swapfile is the real
+#    guarantee (see gc2607-suspend-hibernate.sh). Only disk swap counts — zram is
+#    RAM-backed and cannot hold a hibernation image.
+#
+# 2. post (any):
+#    Restart gc2607-camera.service. It carries Conflicts=sleep.target (to avoid an
+#    -EBUSY panic on suspend) and does NOT come back on its own. The restart must
+#    wait until every sleep-ish target is fully inactive, else systemd rejects it as
+#    a "destructive transaction" (seen 2026-07-01 during a suspend-then-hibernate
+#    fallback: the queued s-t-h job still contradicted the camera start). We detach
+#    via systemd-run --no-block and poll the targets before starting.
+
+MARGIN_MIB=512          # headroom left below free disk-swap when capping the image
+FLOOR_MIB=2048          # never cap the image below this (very-consumed-swap case)
+
+log(){ logger -t gc2607-resume "$*"; }
+
+cap_image_size(){
+    # free disk-swap (type "file"/"partition" that is NOT zram) in KiB
+    local free_kib
+    free_kib=$(awk 'NR>1 && $1 !~ /zram/ {free += $3 - $4} END{print free+0}' /proc/swaps)
+    [ -n "$free_kib" ] && [ "$free_kib" -gt 0 ] || { log "hibernate pre: no disk swap found, leaving image_size default"; return; }
+
+    local cur_bytes cap_bytes floor_bytes
+    cur_bytes=$(cat /sys/power/image_size 2>/dev/null || echo 0)
+    cap_bytes=$(( (free_kib - MARGIN_MIB*1024) * 1024 ))
+    floor_bytes=$(( FLOOR_MIB * 1024 * 1024 ))
+    [ "$cap_bytes" -lt "$floor_bytes" ] && cap_bytes=$floor_bytes
+
+    if [ "$cur_bytes" -eq 0 ] || [ "$cap_bytes" -lt "$cur_bytes" ]; then
+        if echo "$cap_bytes" > /sys/power/image_size 2>/dev/null; then
+            log "hibernate pre: capped image_size to $((cap_bytes/1024/1024)) MiB (disk-swap free $((free_kib/1024)) MiB)"
+        else
+            log "hibernate pre: FAILED to write image_size (SELinux?); disk-swap free $((free_kib/1024)) MiB"
+        fi
+    else
+        log "hibernate pre: image_size $((cur_bytes/1024/1024)) MiB already fits disk-swap free $((free_kib/1024)) MiB"
+    fi
+}
+
+restart_camera_when_safe(){
+    # Detach: run AFTER this hook returns and the sleep transaction settles.
+    systemd-run --no-block --collect /bin/sh -c '
+        for i in $(seq 1 30); do
+            busy=""
+            for t in sleep.target suspend.target hibernate.target suspend-then-hibernate.target; do
+                [ "$(systemctl is-active "$t" 2>/dev/null)" = active ] && busy=1
+            done
+            [ -z "$busy" ] && break
+            sleep 1
+        done
+        systemctl start gc2607-camera.service
+    ' || { log "systemd-run failed to schedule camera restart"; exit 1; }
+}
 
 case "$1" in
+    pre)
+        case "$2" in
+            hibernate|suspend-then-hibernate|hybrid-sleep) cap_image_size ;;
+        esac
+        ;;
     post)
-        # Spawn a detached transient unit that waits briefly for
-        # sleep.target to wind down, then starts the camera service.
-        # Running this inline (or even backgrounded with &) would still
-        # be scoped to systemd-suspend.service and race the suspend
-        # transaction; systemd-run breaks the parent-unit relationship.
-        if ! systemd-run --no-block --collect \
-                /bin/sh -c 'sleep 2; systemctl start gc2607-camera.service'; then
-            logger -t gc2607-resume "systemd-run failed to schedule camera restart"
-            exit 1
-        fi
+        restart_camera_when_safe
         ;;
 esac
