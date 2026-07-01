@@ -1,0 +1,5 @@
+# date	label	peak_W	avg_W	avg_V	charging_s/total	cap%	note
+2026-06-25 12:51	cable-A-good	11.89	10.90	12.80	29/30	80->80	ok
+2026-06-25 12:53	cable-B-suspect	11.88	11.16	12.80	30/30	80->80	ok
+2026-06-25 12:55	cables-A+B-series	0.00	0.00	n/a	0/0	80->80	0W in THIS orientation (also 0W cables-swapped) - NOT a defect; charges when 1 plug rotated 180 (see series-flipped)
+2026-06-25 13:01	series-flipped	12.86	7.41	12.54	15/20	77->77	CHARGES but UNSTABLE: AC0 input fully DROPS (online 1->0) ~every 15s then re-handshakes at 5.8W->ramps to 11.9W. Confirmed @0.5s res (4 AC transitions/40s). Coupler OK in right orientation; chained C-C = marginal/non-compliant PD - do NOT use for charging; single cable = steady 11.9W
