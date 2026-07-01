@@ -20,7 +20,21 @@
 #    guarantee (see gc2607-suspend-hibernate.sh). Only disk swap counts — zram is
 #    RAM-backed and cannot hold a hibernation image.
 #
-# 2. post (any):
+# 2. pre (ANY sleep type): pause all running Docker containers; post: unpause them.
+#    Root cause seen 2026-07-01 (boot -2, 10:29:33): a `runc:[2:INIT]` task was stuck
+#    in de_thread() mid-execve (state:D, syscall 59) when the freezer ran -> "Freezing
+#    user space processes failed after 20.007 seconds (1 tasks refusing to freeze)" ->
+#    wedged suspend. runc is multi-threaded (Go); execve must reap sibling threads in
+#    de_thread(), an UNINTERRUPTIBLE wait that cannot be frozen. It's a timing race:
+#    container healthchecks spawn a steady stream of short-lived runc execs, so on a
+#    container-heavy box one is occasionally mid-de_thread at freeze time. (NOT the
+#    Azure CIFS mount — that was a same-boot red herring, absent from the stack.)
+#    Pausing every container before the freezer runs stops healthcheck runc churn and
+#    freezes container procs via the freezer cgroup, closing the race. Best-effort and
+#    timeout-bounded: a pause failure never blocks the sleep. Records what it paused in
+#    $PAUSED_STATE so post only unpauses those (not ones the user paused by hand).
+#
+# 3. post (any):
 #    Restart gc2607-camera.service. It carries Conflicts=sleep.target (to avoid an
 #    -EBUSY panic on suspend) and does NOT come back on its own. The restart must
 #    wait until every sleep-ish target is fully inactive, else systemd rejects it as
@@ -30,8 +44,39 @@
 
 MARGIN_MIB=512          # headroom left below free disk-swap when capping the image
 FLOOR_MIB=2048          # never cap the image below this (very-consumed-swap case)
+PAUSED_STATE=/run/gc2607-paused-containers   # tmpfs; survives sleep, cleared on reboot
 
 log(){ logger -t gc2607-resume "$*"; }
+
+pause_containers(){
+    command -v docker >/dev/null 2>&1 || return 0
+    rm -f "$PAUSED_STATE"
+    local running n
+    # status=running excludes already-paused ones, so post won't unpause user-paused containers
+    running=$(timeout 10 docker ps -q -f status=running 2>/dev/null) || { log "sleep pre: docker ps failed/timed out; not pausing"; return 0; }
+    [ -n "$running" ] || { log "sleep pre: no running containers to pause"; return 0; }
+    n=$(printf '%s\n' "$running" | grep -c .)
+    printf '%s\n' "$running" > "$PAUSED_STATE"
+    # shellcheck disable=SC2086
+    if timeout 30 docker pause $running >/dev/null 2>&1; then
+        log "sleep pre: paused $n container(s) to avoid the runc de_thread freeze race"
+    else
+        log "sleep pre: WARNING docker pause failed/timed out; sleeping anyway (runc race possible)"
+    fi
+}
+
+unpause_containers(){
+    [ -s "$PAUSED_STATE" ] || { rm -f "$PAUSED_STATE"; return 0; }
+    local ids n
+    ids=$(cat "$PAUSED_STATE" 2>/dev/null)
+    n=$(printf '%s\n' "$ids" | grep -c .)
+    if command -v docker >/dev/null 2>&1 && [ -n "$ids" ]; then
+        # shellcheck disable=SC2086
+        timeout 30 docker unpause $ids >/dev/null 2>&1
+        log "sleep post: unpaused $n container(s)"
+    fi
+    rm -f "$PAUSED_STATE"
+}
 
 cap_image_size(){
     # free disk-swap (type "file"/"partition" that is NOT zram) in KiB
@@ -73,11 +118,13 @@ restart_camera_when_safe(){
 
 case "$1" in
     pre)
+        pause_containers              # every sleep type — the freeze race hit the s2idle leg
         case "$2" in
             hibernate|suspend-then-hibernate|hybrid-sleep) cap_image_size ;;
         esac
         ;;
     post)
+        unpause_containers
         restart_camera_when_safe
         ;;
 esac
