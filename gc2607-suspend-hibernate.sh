@@ -19,8 +19,18 @@
 #   /etc/systemd/sleep.conf.d/90-gc2607-hibernate.conf   -> [Sleep] HibernateDelaySec=DELAY
 #   /etc/systemd/logind.conf.d/90-gc2607-hibernate.conf  -> [Login] HandleLidSwitch=suspend-then-hibernate
 #                                                                    HandleLidSwitchExternalPower=suspend
-#   sleep.conf takes effect on the NEXT suspend (read at sleep time). The logind lid change needs a
-#   `systemctl restart systemd-logind` (sessions survive it on systemd>=255) OR a reboot — install prints this.
+#   sleep.conf takes effect on the NEXT suspend (read at sleep time). The logind lid change needs a REBOOT.
+#   NEVER `systemctl restart systemd-logind` on a live GNOME session: gnome-shell loses control of every
+#   input device ("NotInControl") and the only way out is a forced power-off. Happened 2026-06-25 and again
+#   2026-09-22 08:40:46, the second time because this header used to claim sessions survive it.
+#
+# disable / enable (added 2026-09-22): RESUME from hibernate is unreliable on this machine. 2026-09-21 the
+#   image was written completely (chain walked, 91,123 chunks framed OK, header marked) and the machine
+#   powered off; the morning resume hung and needed a power-button hold. 2026-09-11 a resumed session died
+#   64 s later. `disable` turns hibernate off at the source (logind then reports CanHibernate=no, so
+#   suspend-then-hibernate and hybrid-sleep go too) and makes UPower power off cleanly at critical battery
+#   instead of calling logind Sleep(), which would otherwise fall back to a plain suspend that runs the
+#   battery flat. `enable` deletes both files.
 #
 # PRECHECK: hibernate must be available + swap >= RAM. install WARNS (does not block — user said "assume it
 #   works, will verify"). Verify once with:  sudo bash THIS test   (it hibernates now; power on to confirm).
@@ -30,6 +40,8 @@ CMD="${1:-status}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLEEP_D=/etc/systemd/sleep.conf.d/90-gc2607-hibernate.conf
 LOGIN_D=/etc/systemd/logind.conf.d/90-gc2607-hibernate.conf
+NOHIB_D=/etc/systemd/sleep.conf.d/95-gc2607-no-hibernate.conf
+UPOWER_D=/etc/UPower/UPower.conf.d/90-gc2607-critical-poweroff.conf
 HOOK_SRC="$SCRIPT_DIR/gc2607-resume"
 HOOK_DST=/usr/lib/systemd/system-sleep/gc2607-resume
 
@@ -87,8 +99,8 @@ EOF
     echo "  $SLEEP_D   (HibernateDelaySec=$DELAY)"
     echo "  $LOGIN_D   (HandleLidSwitch=suspend-then-hibernate)"
     echo
-    echo "ACTIVATE the lid change (sleep.conf is already live on next suspend):"
-    echo "    sudo systemctl restart systemd-logind     # sessions survive on systemd>=255; or just reboot"
+    echo "ACTIVATE the lid change (sleep.conf is already live on next suspend): REBOOT."
+    echo "    Do NOT restart systemd-logind on a live GNOME session - it kills keyboard and mouse."
     echo
     echo "Then test the WHOLE chain WITHOUT waiting 90 min — unplug and run:"
     echo "    sudo bash $0 test                          # verifies hibernate resumes"
@@ -98,7 +110,32 @@ EOF
   uninstall)
     need_root "$@"
     rm -fv "$SLEEP_D" "$LOGIN_D"
-    echo "removed drop-ins. Run: sudo systemctl restart systemd-logind   (or reboot) to revert lid handling."
+    echo "removed drop-ins. REBOOT to revert lid handling (never restart systemd-logind under GNOME)."
+    ;;
+
+  disable)
+    need_root "$@"
+    mkdir -p "$(dirname "$NOHIB_D")" "$(dirname "$UPOWER_D")"
+    cat > "$NOHIB_D" <<EOF
+# gc2607: hibernate OFF. Resume from S4 hung 2026-09-22 after a complete image write; see header of
+# gc2607-suspend-hibernate.sh. AllowHibernation=no also implies no suspend-then-hibernate / hybrid-sleep.
+[Sleep]
+AllowHibernation=no
+EOF
+    cat > "$UPOWER_D" <<EOF
+# gc2607: with hibernate off, CriticalPowerAction=Auto resolves to logind Sleep() -> plain suspend,
+# which would drain the battery flat in s2idle (~2.2 W). Power off cleanly instead.
+[UPower]
+CriticalPowerAction=PowerOff
+EOF
+    echo "wrote $NOHIB_D and $UPOWER_D"
+    echo "logind: live now (verify: busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate)."
+    echo "upower: verify after the next reboot with GetCriticalAction == PowerOff (not restarted here on purpose)."
+    ;;
+
+  enable)
+    need_root "$@"
+    rm -fv "$NOHIB_D" "$UPOWER_D"
     ;;
 
   test)
@@ -171,5 +208,5 @@ EOF
     echo "     stall suspend 20 s — stop heavy containers before a lid-close hibernate."
     ;;
 
-  *) echo "usage: sudo bash $0 {status|diag|install [DELAY]|repair [DELAY]|uninstall|test}"; exit 2 ;;
+  *) echo "usage: sudo bash $0 {status|diag|install [DELAY]|repair [DELAY]|uninstall|disable|enable|test}"; exit 2 ;;
 esac

@@ -150,6 +150,22 @@ elif [ -n "$SRC_SLOW" ] || [ -n "$SRC_DOCK" ]; then
     CLASS="LIKELY USERSPACE-HANG  (overload markers: 'system too slow'/stuck container -> review before counting)"
 fi
 
+# --- 8.6 hibernate-aware class (2026-09-22) -------------------------------
+# A hibernate leaves NO shutdown fingerprint, so gc2607-boot-incident.sh fires
+# triage on every un-resumed hibernate and the default above then reads
+# "SILENT-FREEZE". If the dead boot's LAST kernel line is "hibernation entry",
+# the session never came back from S4: either the image write hung, or the
+# image was written and the RESUME hung. The journal cannot tell those apart
+# (nothing is logged on either path), and "PM: Image not found" is NOT evidence:
+# it is printed on EVERY ordinary boot. gc2607-hib-image-probe.py can tell them
+# apart from the swap header + image chain, provided the swapfile has not been
+# written since. 2026-09-22 was the second case (complete image, resume hung).
+HIB_ENTRY=$(j -n 1 -o cat _TRANSPORT=kernel | grep -c 'hibernation: hibernation entry')
+echo "hibernate entry as last kernel line: $HIB_ENTRY"
+if [ "$HIB_ENTRY" -gt 0 ]; then
+    CLASS="HIBERNATE-NOT-RESUMED  (write or resume hung; NOT an in-use silent freeze -> run: sudo python3 gc2607-hib-image-probe.py)"
+fi
+
 # --- 9. verdict -----------------------------------------------------------
 echo
 echo "================= VERDICT ================="
