@@ -76,6 +76,16 @@ sudo /usr/local/sbin/gc2607-cstate-test.sh protect-now   # live global C6-off (m
 ```
 or reboot and pick the 7.0.11 fallback entry.
 
+### Audio & Bluetooth Dynamic Routing (PipeWire / WirePlumber)
+- **Automatic Auto-Switch**: Bluetooth audio devices (Sony WF-1000XM5) take over when connected (`priority.session = 2010`) and seamlessly fall back to internal speakers (`priority.session = 1600`) and internal mic (`priority.session = 1648`) when disconnected.
+- **AirPlay Masking**: `~/.config/pipewire/pipewire.conf.d/50-raop.conf` (`module.raop = false`) prevents network TVs/receivers from hijacking audio. (A WirePlumber `monitor.alsa.rules` match cannot do this: AirPlay sinks come from PipeWire's `raop-discover` module, not the ALSA monitor. The former `50-disable-raop.conf` was dead and was removed 2026-09-23.)
+- **Unpinned State**: Never hardcode default devices via `wpctl set-default` (which injects a +30k priority penalty that breaks Bluetooth auto-switching). Clear any stuck pin via:
+  ```bash
+  pw-metadata -n default 0 default.configured.audio.sink ""
+  pw-metadata -n default 0 default.configured.audio.source ""
+  ```
+
+
 ## Build/packaging gotchas (don't re-learn)
 - Kernel-loadable module compression **must** be `xz --check=crc32 --lzma2=dict=1MiB` (plain `xz -9` fails at insmod).
 - depmod `override` lines key on the **dash** form: `override ipu-bridge * extra`.
