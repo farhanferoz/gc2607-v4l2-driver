@@ -3,6 +3,14 @@
 **Date opened:** 2026-05-21
 **Trigger:** Recurring in-use hard freezes after F44 upgrade (kernel 7.0.x), distinct from the May 2 deep-S3 suspend hang
 
+> **🟡 2026-09-23: ROOT-CAUSE TEST RUN; THE HANG DID NOT REPRODUCE, SO NO CAUSE WAS FOUND. Hibernate re-enabled (`gc2607-suspend-hibernate.sh install 90min`).**
+>
+> Executed `docs/hibernate-resume-root-cause-test.md` via `gc2607-hibernate-test.sh`:
+> - **Step 1 (`test_resume`):** PASSED on **7.2.5-200** (the kernel that hung on 09-21), 08:40:32 entry -> 08:42:22 restored, direct sysfs write, no S4 wake line. The in-kernel restore path works on that kernel.
+> - **Step 2 (cold-boot resume):** PASSED 2/2 cycles on **7.2.7-200** (installed that morning) with `no_console_suspend`, both via `systemctl hibernate` and both logging `ACPI: PM: Waking up from system sleep state S4`. Cycle 1 08:50:16 -> 08:51:41, cycle 2 08:53:23 -> 08:54:30; snapshot ~12.6 GB. The restore times (2.84 s, 2.43 s) are not in the journal: the loader kernel's log is not kept. Docker containers came back unpaused.
+> - **What this does not cover:** the plan asks for 3-4 cold-boot cycles, not 2; both ran on AC with an immediate hibernate, while the 09-21 hang followed 90 min of s2idle on battery and a night powered off, on 7.2.5. The next unplugged overnight lid-close is the real test; if it hangs, run step 2.4 (`gc2607-hib-image-probe.py`) before anything touches swap.
+> - **Resolution:** `cleanup` restored `rhgb quiet` in `/etc/default/grub` and `/etc/kernel/cmdline`. Re-installed 90-minute suspend-then-hibernate (`gc2607-suspend-hibernate.sh install 90min`). Until the next reboot the running kernel still carries `no_console_suspend` and the step switches (`pm_async=0`, `pm_print_times=1`, `pm_debug_messages=1`, console loglevel 8), and logind still applies plain `suspend` on lid close; one reboot clears all of it.
+>
 > **🔴 2026-09-22: WEDGE, NEW CLASS: the machine hung RESUMING from hibernate, not in use. Hibernate is now OFF at the source (`gc2607-suspend-hibernate.sh disable`) pending a root-cause test.**
 >
 > **What happened.** 2026-09-21 17:08:28 lid closed on AC, plain suspend. 17:14:20 woke (mains cable out); on battery the lid rule chose `suspend-then-hibernate`, s2idle from 17:15:23. After `HibernateDelaySec=90min`, at **18:45:27** it began hibernating; that is the last journal line, as it is for every hibernate. The next morning the machine would not come up and needed a power-button hold; the 08:24:12 boot after that was normal.
