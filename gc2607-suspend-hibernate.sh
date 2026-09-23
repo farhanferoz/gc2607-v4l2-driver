@@ -31,6 +31,9 @@
 #   suspend-then-hibernate and hybrid-sleep go too) and makes UPower power off cleanly at critical battery
 #   instead of calling logind Sleep(), which would otherwise fall back to a plain suspend that runs the
 #   battery flat. `enable` deletes both files.
+#   The hibernate self-test (workspace-sync monitoring/agents/laptop/hibernate_selftest.sh) runs a
+#   ROOT-OWNED COPY of this script at /usr/local/sbin; after changing disable/enable, re-run
+#   install_hibernate_selftest.sh or the self-test keeps using the old copy.
 #
 # PRECHECK: hibernate must be available + swap >= RAM. install WARNS (does not block — user said "assume it
 #   works, will verify"). Verify once with:  sudo bash THIS test   (it hibernates now; power on to confirm).
