@@ -141,6 +141,13 @@ EOF
     rm -fv "$NOHIB_D" "$UPOWER_D"
     ;;
 
+  selftest-install)
+    # Installs the automatic hibernate resume self-test (header of the installer below). It lives in
+    # workspace-sync; this is the laptop's sudo-able entry point for hibernate management.
+    need_root "$@"
+    exec bash /home/ff235/dev/workspace-sync/monitoring/agents/laptop/install_hibernate_selftest.sh
+    ;;
+
   test)
     need_root "$@"
     echo "This HIBERNATES the machine NOW (full power-off; RAM written to swap). Save your work."
@@ -211,5 +218,5 @@ EOF
     echo "     stall suspend 20 s — stop heavy containers before a lid-close hibernate."
     ;;
 
-  *) echo "usage: sudo bash $0 {status|diag|install [DELAY]|repair [DELAY]|uninstall|disable|enable|test}"; exit 2 ;;
+  *) echo "usage: sudo bash $0 {status|diag|install [DELAY]|repair [DELAY]|uninstall|disable|enable|test|selftest-install}"; exit 2 ;;
 esac
