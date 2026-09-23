@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -129,6 +130,9 @@
 
 /* V4L2 capture buffers */
 #define NUM_BUFFERS     4
+#define CHROMA_GAIN_Q8  320 /* 1.25x colour strength (256 = off); added 2026-09-23 */
+#define CAPTURE_STALL_S 5   /* seconds without a frame before the capture is reset */
+#define MAX_STREAM_FAILS 5  /* consecutive failed sessions before exiting for systemd */
 
 /* Lazy activation: how often to write standby frames while idle (ms) */
 #define STANDBY_INTERVAL_MS  2000
@@ -326,11 +330,16 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
                                 uint8_t r1, uint8_t g1, uint8_t b1,
                                 uint8_t *out)
 {
-    /* BT.601 full-range coefficients */
+    /* BT.601 limited ("studio") range: Y 16-235, U/V 16-240, what YUYV consumers assume. */
     int y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16;
     int y1 = ((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16;
-    int u  = ((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8) + 128;
-    int v  = ((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8) + 128;
+    int u  = ((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8);
+    int v  = ((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8);
+    /* Stand-in for the colour-correction matrix this ISP never had (recorded as the open
+     * colour-accuracy gap in docs/archive/PROJECT_HISTORY.md): a raw sensor's colours are
+     * muddier than the eye's, and the missing CCM is mostly a saturation lift. */
+    u = (u * CHROMA_GAIN_Q8) / 256 + 128;
+    v = (v * CHROMA_GAIN_Q8) / 256 + 128;
 
     out[0] = (uint8_t)(y0 < 16 ? 16 : (y0 > 235 ? 235 : y0));
     out[1] = (uint8_t)(u  < 16 ? 16 : (u  > 240 ? 240 : u));
@@ -720,13 +729,19 @@ static void set_sensor_controls(const char *subdev_path, int exposure, int gain)
  */
 static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
 {
-    int fd = open(dev, O_RDWR);
+    /* Non-blocking, so the frame wait in streaming_loop() can time out on a stalled
+     * sensor instead of sleeping in DQBUF forever (and past SIGTERM). */
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) {
         perror("open capture device");
         return -1;
     }
+    int mapped = 0;
+    int have_bufs = 0;
 
-    /* Set format */
+    /* Set format, then check what the driver actually granted: process_frame()
+     * reads rows at a fixed SENSOR_W stride, so any adjustment would read the
+     * wrong pixels or past the end of the buffer. */
     struct v4l2_format fmt = {0};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width = SENSOR_W;
@@ -735,22 +750,33 @@ static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
         perror("VIDIOC_S_FMT");
-        close(fd);
-        return -1;
+        goto fail;
+    }
+    if (fmt.fmt.pix.width != SENSOR_W || fmt.fmt.pix.height != SENSOR_H ||
+        fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_SGRBG10 ||
+        fmt.fmt.pix.bytesperline != SENSOR_W * 2) {
+        fprintf(stderr, "[gc2607_isp] capture format %ux%u stride %u is not the %dx%d SGRBG10 "
+                "stride %d this ISP reads\n", fmt.fmt.pix.width, fmt.fmt.pix.height,
+                fmt.fmt.pix.bytesperline, SENSOR_W, SENSOR_H, SENSOR_W * 2);
+        goto fail;
     }
 
-    /* Request buffers */
+    /* Request buffers. buffers[] holds NUM_BUFFERS; the driver may grant a
+     * different count, so refuse rather than overflow it. */
     struct v4l2_requestbuffers req = {0};
     req.count = NUM_BUFFERS;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
         perror("VIDIOC_REQBUFS");
-        close(fd);
-        return -1;
+        goto fail;
     }
-
-    *n_buffers = req.count;
+    have_bufs = 1;
+    if (req.count < 2 || req.count > NUM_BUFFERS) {
+        fprintf(stderr, "[gc2607_isp] driver granted %u buffers, need 2..%d\n",
+                req.count, NUM_BUFFERS);
+        goto fail;
+    }
 
     /* Map buffers */
     for (int i = 0; i < (int)req.count; i++) {
@@ -760,8 +786,12 @@ static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
         buf.index = i;
         if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
             perror("VIDIOC_QUERYBUF");
-            close(fd);
-            return -1;
+            goto fail;
+        }
+        if (buf.length < (unsigned)FRAME_PIXELS * 2) {
+            fprintf(stderr, "[gc2607_isp] buffer %d is %u bytes, a frame needs %d\n",
+                    i, buf.length, FRAME_PIXELS * 2);
+            goto fail;
         }
 
         buffers[i].length = buf.length;
@@ -769,9 +799,9 @@ static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
                                 MAP_SHARED, fd, buf.m.offset);
         if (buffers[i].start == MAP_FAILED) {
             perror("mmap");
-            close(fd);
-            return -1;
+            goto fail;
         }
+        mapped++;
     }
 
     /* Queue buffers */
@@ -782,8 +812,7 @@ static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
         buf.index = i;
         if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
             perror("VIDIOC_QBUF");
-            close(fd);
-            return -1;
+            goto fail;
         }
     }
 
@@ -791,11 +820,25 @@ static int open_capture(const char *dev, struct buffer *buffers, int *n_buffers)
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
         perror("VIDIOC_STREAMON");
-        close(fd);
-        return -1;
+        goto fail;
     }
 
+    *n_buffers = req.count;
     return fd;
+
+fail:
+    /* Undo everything: a live mapping keeps the file (and so the buffer queue)
+     * owned after close(), and every retry would then fail with EBUSY. */
+    for (int i = 0; i < mapped; i++)
+        munmap(buffers[i].start, buffers[i].length);
+    if (have_bufs) {
+        struct v4l2_requestbuffers none = {0};
+        none.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        none.memory = V4L2_MEMORY_MMAP;
+        xioctl(fd, VIDIOC_REQBUFS, &none);
+    }
+    close(fd);
+    return -1;
 }
 
 /*
@@ -1040,7 +1083,26 @@ static int streaming_loop(const char *capture_dev, int out_fd,
     clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
     clock_gettime(CLOCK_MONOTONIC, &last_consumer_check);
 
+    int stalled_s = 0;
     while (running) {
+        /* Wait at most a second for a frame, so a stalled sensor or a SIGTERM is
+         * noticed instead of blocking in DQBUF for ever. */
+        struct pollfd pfd = { .fd = cap_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 1000);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            perror("poll capture");
+            break;
+        }
+        if (pr == 0) {
+            if (++stalled_s >= CAPTURE_STALL_S) {
+                printf("[gc2607_isp] No frame for %ds, restarting capture\n", stalled_s);
+                break;
+            }
+            continue;
+        }
+        stalled_s = 0;
+
         /* Dequeue a capture buffer */
         struct v4l2_buffer buf = {0};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1223,8 +1285,13 @@ int main(int argc, char *argv[])
     printf("[gc2607_isp] Starting with lazy activation (capture=%s output=%s)\n",
            capture_dev, output_dev);
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    /* sigaction without SA_RESTART: glibc's signal() restarts interrupted calls,
+     * which is how a SIGTERM used to wait out the whole stop timeout. */
+    struct sigaction sa = {0};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     /* Find sensor subdevice for exposure/gain control */
     char subdev_path[64] = {0};
@@ -1294,6 +1361,16 @@ int main(int argc, char *argv[])
                    consumer_count);
             int ret = streaming_loop(capture_dev, out_fd,
                                      subdev_path, has_subdev, output_dev);
+            static int stream_fails;
+            stream_fails = (ret < 0) ? stream_fails + 1 : 0;
+            if (ret < 0 && running && stream_fails >= MAX_STREAM_FAILS) {
+                /* Retrying in-process has stopped helping; exit non-zero so
+                 * Restart=on-failure starts from a clean process. */
+                printf("[gc2607_isp] %d streaming failures in a row, exiting\n", stream_fails);
+                cleanup_inotify();
+                close(out_fd);
+                return 1;
+            }
             if (ret < 0 && running) {
                 printf("[gc2607_isp] Streaming error, retrying in 2s...\n");
                 sleep(2);

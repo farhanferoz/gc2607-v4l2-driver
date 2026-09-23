@@ -23,7 +23,7 @@ sleep 1
 
 # Load gc2607
 if ! grep -q "^gc2607 " /proc/modules; then
-    if [ -f "/lib/modules/${KVER}/extra/gc2607.ko" ]; then
+    if [ -f "/lib/modules/${KVER}/extra/gc2607.ko" ] || [ -f "/lib/modules/${KVER}/extra/gc2607.ko.xz" ]; then
         modprobe gc2607
     elif [ -f "${SCRIPT_DIR}/gc2607.ko" ]; then
         insmod "${SCRIPT_DIR}/gc2607.ko"

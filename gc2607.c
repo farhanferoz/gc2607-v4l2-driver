@@ -467,9 +467,14 @@ static void gc2607_power_off(struct gc2607 *gc2607)
 	if (!gc2607->powered)
 		return;
 
-	/* Assert reset if GPIO exists */
+	/*
+	 * Hold the sensor in reset before its clock and supplies go. 1 = asserted
+	 * (physical LOW) per the table in gc2607_power_on(); this wrote 0 until
+	 * 2026-09-23, releasing reset and leaving the line driven high into an
+	 * unpowered sensor.
+	 */
 	if (gc2607->reset_gpio)
-		gpiod_set_value_cansleep(gc2607->reset_gpio, 0);
+		gpiod_set_value_cansleep(gc2607->reset_gpio, 1);
 
 	/* Assert power-down if GPIO exists */
 	if (gc2607->powerdown_gpio)
@@ -619,7 +624,7 @@ static int gc2607_s_stream(struct v4l2_subdev *sd, int enable)
 		}
 
 		/* Apply current control values (exposure, gain) */
-		ret = __v4l2_ctrl_handler_setup(&gc2607->ctrls);
+		ret = v4l2_ctrl_handler_setup(&gc2607->ctrls);
 		if (ret) {
 			dev_err(&client->dev, "Failed to apply controls: %d\n", ret);
 			pm_runtime_put(&client->dev);
@@ -648,7 +653,7 @@ static int gc2607_s_ctrl(struct v4l2_ctrl *ctrl)
 	int ret = 0;
 
 	/* Only apply controls when streaming */
-	if (!pm_runtime_get_if_in_use(&client->dev))
+	if (pm_runtime_get_if_in_use(&client->dev) <= 0)
 		return 0;
 
 	switch (ctrl->id) {
@@ -781,7 +786,13 @@ static int gc2607_runtime_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops gc2607_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(gc2607_runtime_suspend, gc2607_runtime_resume)
+	/*
+	 * force_suspend/resume go through runtime PM's own bookkeeping, so a sensor
+	 * that was idle (runtime-suspended) before sleep stays off after resume.
+	 * Calling the runtime callbacks directly powered it ON at every resume
+	 * while runtime PM still believed it was off.
+	 */
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	SET_RUNTIME_PM_OPS(gc2607_runtime_suspend, gc2607_runtime_resume, NULL)
 };
 
@@ -969,7 +980,7 @@ static int gc2607_probe(struct i2c_client *client)
 	if (gc2607->ctrls.error) {
 		ret = gc2607->ctrls.error;
 		dev_err(dev, "Control handler init failed: %d\n", ret);
-		goto err_media;
+		goto err_ctrls;
 	}
 
 	/* Initialize current mode and format */
@@ -1001,11 +1012,20 @@ static int gc2607_probe(struct i2c_client *client)
 	/* Power off after detection */
 	pm_runtime_put(dev);
 
-	/* Register async subdev for IPU6 integration */
-	ret = v4l2_async_register_subdev(&gc2607->sd);
+	/*
+	 * Register async subdev for IPU6 integration. The _sensor variant is the one
+	 * that looks up the "privacy" LED (INT3472 provides GCTI2607_00::privacy_led),
+	 * which the V4L2 core then lights on every stream start. With the plain
+	 * variant the LED stayed OFF while the camera streamed (measured 2026-09-23).
+	 */
+	ret = v4l2_async_register_subdev_sensor(&gc2607->sd);
 	if (ret) {
 		dev_err(dev, "Failed to register async subdev: %d\n", ret);
-		goto err_power;
+		pm_runtime_disable(dev);
+		if (!pm_runtime_status_suspended(dev))
+			gc2607_power_off(gc2607);
+		pm_runtime_set_suspended(dev);
+		goto err_ctrls;
 	}
 
 	dev_info(dev, "GC2607 probe successful\n");
@@ -1022,8 +1042,8 @@ err_power:
 err_pm:
 	pm_runtime_disable(dev);
 	pm_runtime_set_suspended(dev);
+err_ctrls:
 	v4l2_ctrl_handler_free(&gc2607->ctrls);
-err_media:
 	media_entity_cleanup(&gc2607->sd.entity);
 	return ret;
 }

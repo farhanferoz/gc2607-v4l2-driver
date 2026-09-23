@@ -11,6 +11,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/gc2607"
+
+# `unit`: install gc2607-camera.service only and reload systemd. The running service is not
+# restarted; the new unit applies from its next start.
+if [ "${1:-}" = unit ]; then
+    install -m 0644 "${SCRIPT_DIR}/gc2607-camera.service" /etc/systemd/system/gc2607-camera.service
+    systemctl daemon-reload
+    echo "Installed gc2607-camera.service (effective from the next start)."
+    exit 0
+fi
 USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 USER_HOME=$(getent passwd "$USER" | cut -d: -f6)
 
@@ -72,16 +81,22 @@ echo "Installing wireplumber config..."
 WPDIR="${USER_HOME}/.config/wireplumber/wireplumber.conf.d"
 mkdir -p "$WPDIR"
 cat > "$WPDIR/50-hide-ipu6-raw.conf" << 'EOF'
+# Hide the IPU6 raw V4L2 capture nodes (they are not usable cameras).
+#
+# MEASURED 2026-09-18: doing this at DEVICE level (device.disabled = true) breaks
+# ALL audio under wireplumber 0.5.17 -- every ALSA node comes up with no ports, so
+# nothing links and both capture and playback hang with no error. Disabling the
+# NODE leaves device enumeration intact.
 monitor.v4l2.rules = [
   {
     matches = [
       {
-        device.name = "~v4l2_device.pci-*"
+        node.name = "~v4l2_input.pci-.*"
       }
     ]
     actions = {
       update-props = {
-        device.disabled = true
+        node.disabled = true
       }
     }
   }
@@ -91,7 +106,7 @@ chown -R "${USER}:${USER}" "${USER_HOME}/.config/wireplumber"
 
 # Install systemd service
 echo "Installing systemd service..."
-cat > /etc/systemd/system/gc2607-camera.service << SVCEOF
+install -m 0644 "${SCRIPT_DIR}/gc2607-camera.service" /etc/systemd/system/gc2607-camera.service
 [Unit]
 Description=GC2607 Camera Virtual Webcam
 After=multi-user.target graphical.target
