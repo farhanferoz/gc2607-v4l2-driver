@@ -1,7 +1,9 @@
 """Read-only: did the last hibernate image finish writing, and which kernel wrote it?
 
 Run as root after a hibernate that never came back, BEFORE the swapfile is used again:
-    sudo python3 gc2607-hib-image-probe.py
+    sudo python3 gc2607-hib-image-probe.py [--all] [STRING ...]  # e.g. 7.2.9-200; default: the running kernel's
+Which boot wrote the image: pass boot ids (journalctl --list-boots) with --all; only that boot's id is in it.
+gc2607-crash-triage.sh runs it automatically, passing the dead boot's release.
 Complete chain + a kernel release only that kernel could hold => the WRITE finished and the RESUME hung
 (2026-09-22: 2776 map pages, 91,123 chunks framed OK, 7.2.5 text in 82 chunks). A broken chain or an
 older release => the write never finished. The swap signature is reset by any resume attempt that finds
@@ -14,15 +16,20 @@ On x86 the info page (entries[0]) holds restore_data_record over the uts, so the
 release is read from the compressed data instead.
 """
 
+import platform
 import struct
+import sys
 
 DEV = "/dev/nvme0n1p8"
 RESUME_PAGE = 22100502  # resume_offset= on the kernel command line
 PAGE = 4096
 ENTRIES = 511
 CMP_SIZE_MAX = 40 * PAGE  # generous upper bound on one compressed 32-page chunk
-TAGS = (b"7.2.5-200", b"7.2.4-200", b"7.1.13-200")
-SCAN_PAGES = 30000
+# Strings to look for: argv, else the running kernel's release (uname -r minus ".fc44.x86_64").
+# --all searches the whole image instead of its first SCAN_PAGES pages (boot ids sit anywhere).
+ARGS = [a for a in sys.argv[1:] if a != "--all"]
+TAGS = tuple(a.encode() for a in ARGS) or (platform.release().split(".fc")[0].encode(),)
+SCAN_PAGES = 1 << 62 if "--all" in sys.argv[1:] else 30000
 MAX_MAP_PAGES = 20000  # a 36 GB swap file holds at most ~17,500 map pages
 
 
@@ -76,7 +83,7 @@ def main() -> None:
             f"chunks={chunks} compressed_bytes={cmp_total} framing={'OK to the last entry' if not framing_err and i == len(entries) else framing_err or f'overran: i={i} entries={len(entries)}'}"
         )
         for t, hits in tag_hits.items():
-            print(f"{t.decode()}: {len(hits)} chunks contain it (first chain indices {hits[:5]}) within first {SCAN_PAGES} chain pages")
+            print(f"{t.decode()}: {len(hits)} chunks contain it (first chain indices {hits[:5]}) within {"the whole image" if SCAN_PAGES > len(entries) else f"the first {SCAN_PAGES} chain pages"}")
 
 
 if __name__ == "__main__":

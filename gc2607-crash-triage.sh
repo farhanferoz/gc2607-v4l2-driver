@@ -90,8 +90,13 @@ echo "--- /sys/fs/pstore ---";        ls -la /sys/fs/pstore/
 echo "--- /var/lib/systemd/pstore ---"; ls -laR /var/lib/systemd/pstore/ 2>/dev/null | head -20
 # systemd-pstore here archives FLAT files (dmesg-ramoops-N), not per-boot subdirs; the
 # */* glob alone missed the first two records this machine ever kept (2026-10-08/09).
+# Only records written after the dead boot ended belong to it: the archive keeps every earlier crash,
+# and copying those made 2026-10-09's hang look like it left a record (it left none).
+END_S=$(( $(date -d "$CRASH_END" +%s 2>/dev/null || echo 0) - 60 ))
 for f in /sys/fs/pstore/* /var/lib/systemd/pstore/* /var/lib/systemd/pstore/*/*; do
-    [ -f "$f" ] && cp -a "$f" "$EV/" && echo "ARCHIVED: $f"
+    [ -f "$f" ] || continue
+    if [ "$(stat -c %Y "$f")" -ge "$END_S" ]; then cp -a "$f" "$EV/" && echo "ARCHIVED: $f"
+    else echo "older than this crash, not copied: $f ($(stat -c %y "$f" | cut -c1-19))"; fi
 done
 echo "--- ramoops address parity (must match across boots for records to survive) ---"
 for b in "$BOOT" 0; do
@@ -162,10 +167,17 @@ fi
 # it is printed on EVERY ordinary boot. gc2607-hib-image-probe.py can tell them
 # apart from the swap header + image chain, provided the swapfile has not been
 # written since. 2026-09-22 was the second case (complete image, resume hung).
-HIB_ENTRY=$(j -n 1 -o cat _TRANSPORT=kernel | grep -c 'hibernation: hibernation entry')
+# The dead boot's LAST hibernate event, not its last line: on 2026-10-09 "Filesystems sync" followed
+# the entry, so the last-line test read that hang as SILENT-FREEZE. Checked on all 16 boots that day.
+HIB_LAST=$(j -o cat _TRANSPORT=kernel | grep -E 'hibernation: hibernation (entry|exit)' | tail -1)
+HIB_ENTRY=0; [ "${HIB_LAST##*hibernation }" = entry ] && HIB_ENTRY=1
 echo "hibernate entry as last kernel line: $HIB_ENTRY"
 if [ "$HIB_ENTRY" -gt 0 ]; then
-    CLASS="HIBERNATE-NOT-RESUMED  (write or resume hung; NOT an in-use silent freeze -> run: sudo python3 gc2607-hib-image-probe.py)"
+    CLASS="HIBERNATE-NOT-RESUMED  (write or resume hung; NOT an in-use silent freeze; see hib-image-probe.txt)"
+    # Read the image NOW, before swap is used again (2026-10-09: a hang went untriaged and unprobed).
+    REL=$(j -k -o cat | grep -m1 -oE 'Linux version [^ ]+' | awk '{print $3}' | sed 's/\.fc[0-9]*\..*//')
+    echo "--- hib-image-probe (dead boot's kernel: ${REL:-unknown}) ---"
+    python3 -I "$(dirname "$(readlink -f "$0")")/gc2607-hib-image-probe.py" ${REL:+"$REL"} 2>&1 | tee "$EV/hib-image-probe.txt"
 fi
 
 # --- 9. verdict -----------------------------------------------------------
@@ -184,7 +196,7 @@ if [ -n "${NAS_END:-}" ] && [ -n "$CRASH_END" ]; then
     fi
     [ "${CLASS#SILENT-FREEZE}" = "$CLASS" ] && echo "  (DIRECTION is only meaningful for a true freeze - see CLASSIFICATION above)"
 fi
-echo "pstore records    : $(ls /sys/fs/pstore/ /var/lib/systemd/pstore/ 2>/dev/null | grep -vcE '^$|:')"
+echo "pstore records    : $(find "$EV" -maxdepth 1 -name '*ramoops*' | wc -l) belonging to this crash"
 echo "evidence pack     : $EV"
 echo "==========================================="
 } 2>&1 | tee "$EV/triage-report.txt"

@@ -14,10 +14,12 @@ if ! journalctl -b -1 -n1 --no-pager >/dev/null 2>&1; then
   logger -t "$TAG" "no previous boot recorded; skip"; exit 0
 fi
 
-# clean shutdowns leave one of these fingerprints in the tail of the boot;
-# a silent wedge leaves none (the last lines are just normal operation).
-if journalctl -b -1 -n 150 --no-pager 2>/dev/null \
-     | grep -qiE "systemd-shutdown|Reached target.*(Shutdown|Power-Off|Reboot|Halt)|Powering off|Rebooting\.|Shutting down"; then
+# Every clean poweroff/reboot ends in systemd-shutdown (PID 1's last stage), which logs under its
+# own identifier; a wedge or an un-resumed hibernate never gets there. Matching message TEXT was
+# wrong: sssd_kcm's idle exit "Shutting down (status = 0)" at 19:21 passed the 2026-10-09 hibernate
+# hang (and the 09-22 forced power-off) as clean, so neither was triaged. This test classifies all
+# 16 boots in the journal on 2026-10-09 correctly.
+if journalctl -b -1 -t systemd-shutdown -n1 --no-pager -q 2>/dev/null | grep -q .; then
   logger -t "$TAG" "previous boot shut down cleanly; no triage needed"
   exit 0
 fi
