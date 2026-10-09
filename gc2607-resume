@@ -101,6 +101,26 @@ cap_image_size(){
     fi
 }
 
+# 4. pre + (hibernate|suspend-then-hibernate|hybrid-sleep): give the image the NMI watchdog state the
+#    image-LOADING kernel will boot with. Root cause of the 2026-10-08/09 crashes ~2 min after resume:
+#    the powersave tuned profile sets kernel.nmi_watchdog=0; the loader kernel boots with it on (cmdline
+#    nmi_watchdog=panic) and leaves CPU 0's watchdog counter firing when it jumps into the image; the
+#    restored kernel has no perf event to claim those NMIs -> "NMI received for unknown reason" ->
+#    unknown_nmi_panic=1 -> panic (pstore record 2026-10-09; LKML 2024-07 "Unknown NMI after S4 resume").
+#    Deliberately NOT restored in post: a resume with the watchdog on is the case that survived (09-23,
+#    09-26); tuned re-applies its value at its next profile change.
+align_nmi_watchdog(){
+    local cur want=1   # kernel default with CONFIG_HARDLOCKUP_DETECTOR=y (kernel/watchdog.c)
+    case " $(cat /proc/cmdline) " in *" nmi_watchdog=0"*|*" nowatchdog "*) want=0 ;; esac
+    cur=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null) || return 0
+    [ "$cur" = "$want" ] && return 0
+    if echo "$want" > /proc/sys/kernel/nmi_watchdog 2>/dev/null; then
+        log "hibernate pre: nmi_watchdog $cur -> $want to match the image-loading kernel"
+    else
+        log "hibernate pre: FAILED to set nmi_watchdog=$want; resume may take an unclaimed NMI and panic"
+    fi
+}
+
 restart_camera_when_safe(){
     # Detach: run AFTER this hook returns and the sleep transaction settles.
     systemd-run --no-block --collect /bin/sh -c '
@@ -120,7 +140,7 @@ case "$1" in
     pre)
         pause_containers              # every sleep type — the freeze race hit the s2idle leg
         case "$2" in
-            hibernate|suspend-then-hibernate|hybrid-sleep) cap_image_size ;;
+            hibernate|suspend-then-hibernate|hybrid-sleep) cap_image_size; align_nmi_watchdog ;;
         esac
         ;;
     post)

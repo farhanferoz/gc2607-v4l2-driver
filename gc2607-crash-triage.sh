@@ -88,7 +88,9 @@ fi
 # --- 6. pstore: live + durable archive -----------------------------------
 echo "--- /sys/fs/pstore ---";        ls -la /sys/fs/pstore/
 echo "--- /var/lib/systemd/pstore ---"; ls -laR /var/lib/systemd/pstore/ 2>/dev/null | head -20
-for f in /sys/fs/pstore/* /var/lib/systemd/pstore/*/*; do
+# systemd-pstore here archives FLAT files (dmesg-ramoops-N), not per-boot subdirs; the
+# */* glob alone missed the first two records this machine ever kept (2026-10-08/09).
+for f in /sys/fs/pstore/* /var/lib/systemd/pstore/* /var/lib/systemd/pstore/*/*; do
     [ -f "$f" ] && cp -a "$f" "$EV/" && echo "ARCHIVED: $f"
 done
 echo "--- ramoops address parity (must match across boots for records to survive) ---"
