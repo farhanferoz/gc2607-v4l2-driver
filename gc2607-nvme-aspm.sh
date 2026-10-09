@@ -10,12 +10,20 @@
 #   off        - disable L1 ASPM for the drive NOW (runtime, reversible)
 #   on         - re-enable (revert)
 #   install    - persist `off` across boots (systemd oneshot)
-#   uninstall  - remove the persistence
+#   install-early - ALSO turn L1 off the moment the drive appears, in the initramfs (udev rule + dracut)
+#   uninstall  - remove the persistence (service, early rule, rebuilt initramfs)
+#
+# Why install-early (2026-10-09): the oneshot runs After=multi-user.target, so every boot and every
+# hibernate RESUME first runs the drive with the firmware's L1. The kernel that loads a hibernate image
+# reads ~6 GB that way. Both resumes that hung (09-21, 10-09) hung silently (no panic, no reboot,
+# though panic=10 is in that initramfs) - the same signature as this drive's L1 freezes.
 #
 set -u
 VEN=0x15b7; DEVID=0x5017
 PCI=/sys/bus/pci/devices
 SVC=/etc/systemd/system/gc2607-nvme-aspm.service
+RULE=/etc/udev/rules.d/05-gc2607-sn740-aspm.rules
+DRACUT_CONF=/etc/dracut.conf.d/90-gc2607-sn740-aspm.conf
 SELF=$(readlink -f "$0")
 
 find_dev() {
@@ -37,6 +45,11 @@ status() {
   echo "  link         = $(cat "$PCI/$DEV/current_link_speed" 2>/dev/null) x$(cat "$PCI/$DEV/current_link_width" 2>/dev/null)"
   echo "  nvme state   = $(cat /sys/class/nvme/nvme0/state 2>/dev/null)"
   echo "  persisted    = $(systemctl is-enabled gc2607-nvme-aspm.service 2>/dev/null || echo no)"
+  echo "  early rule   = $([ -f "$RULE" ] && echo "$RULE" || echo absent)"
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "  in initramfs = $(lsinitrd "/boot/initramfs-$(uname -r).img" 2>/dev/null | grep -c "${RULE#/}\$") (1 = present)"
+  fi
+  echo "  boot record  = $(journalctl -b -k -o cat --no-pager 2>/dev/null | grep -m1 'gc2607-sn740-aspm' || echo 'none this boot')"
 }
 
 need_root() { [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@"; }
@@ -82,9 +95,33 @@ SVCEOF
     systemctl enable --now gc2607-nvme-aspm.service \
       && echo "installed + enabled via /usr/local/sbin/gc2607-aspm-off (ASPM L1 stays OFF across boots)" \
       || echo "FAILED - run: systemctl status gc2607-nvme-aspm.service" ;;
+  install-early) need_root install-early
+    # ATTR{} writes happen while the rules are processed; the nvme module is loaded by 80-drivers.rules'
+    # RUN, which runs after processing, so L1 is off before the driver touches the drive. The first two
+    # rules only RECORD what the firmware left (matched without any helper program), for the log line.
+    cat > "$RULE" <<'RULES'
+# gc2607: WD SN740 (15b7:5017) freezes silently with PCIe ASPM L1 on (2026-06 incident). Turn L1 off the
+# moment the device appears, before the nvme driver loads, including in the initramfs (which is what
+# loads a hibernate image). Written by gc2607-nvme-aspm.sh install-early.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x15b7", ATTR{device}=="0x5017", ENV{GC2607_L1_FW}="0"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x15b7", ATTR{device}=="0x5017", ATTR{link/l1_aspm}=="1", ENV{GC2607_L1_FW}="1"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x15b7", ATTR{device}=="0x5017", ATTR{link/l1_aspm}="0", RUN+="/bin/sh -c 'echo gc2607-sn740-aspm: firmware left l1_aspm=$env{GC2607_L1_FW}, set 0, ac=$$(cat /sys/class/power_supply/AC*/online 2>/dev/null) > /dev/kmsg'"
+RULES
+    printf '# gc2607: carry the SN740 ASPM L1 rule into the initramfs (gc2607-nvme-aspm.sh install-early)\ninstall_items+=" %s "\n' "$RULE" > "$DRACUT_CONF"
+    command -v restorecon >/dev/null 2>&1 && restorecon -F "$RULE" "$DRACUT_CONF" 2>/dev/null
+    udevadm verify "$RULE" || { echo "udev rule failed verification; initramfs NOT rebuilt"; exit 1; }
+    KV=$(uname -r); IMG=/boot/initramfs-$KV.img; BAK=$IMG.pre-sn740-aspm
+    [ -e "$BAK" ] || cp -a "$IMG" "$BAK"
+    dracut -f --kver "$KV" || { cp -a "$BAK" "$IMG"; echo "dracut FAILED; previous initramfs restored"; exit 1; }
+    if lsinitrd "$IMG" 2>/dev/null | grep -q "${RULE#/}\$" && lsinitrd "$IMG" 2>/dev/null | grep -q 'usr/lib/systemd/systemd$'; then
+      echo "initramfs rebuilt for $KV with $RULE (previous kept as $BAK); effective from the next boot"
+    else
+      cp -a "$BAK" "$IMG"; echo "rebuilt initramfs lacks the rule or systemd; previous restored"; exit 1
+    fi ;;
   uninstall) need_root uninstall
     systemctl disable --now gc2607-nvme-aspm.service 2>/dev/null
     rm -f "$SVC" /usr/local/sbin/gc2607-aspm-off; systemctl daemon-reload
+    if [ -f "$RULE" ] || [ -f "$DRACUT_CONF" ]; then rm -f "$RULE" "$DRACUT_CONF"; dracut -f --kver "$(uname -r)"; fi
     echo "persistence removed (run 'on' to re-enable ASPM now)" ;;
-  *) echo "usage: $0 {status|off|on|install|uninstall}"; exit 2 ;;
+  *) echo "usage: $0 {status|off|on|install|install-early|uninstall}"; exit 2 ;;
 esac
