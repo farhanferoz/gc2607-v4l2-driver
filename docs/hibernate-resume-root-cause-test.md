@@ -1,6 +1,6 @@
 # Hibernate resume hang: root-cause test plan
 
-**Status (2026-09-22):** hibernate is OFF (`sudo bash gc2607-suspend-hibernate.sh disable`). This plan is how to find
+**Status (2026-09-22, superseded below):** hibernate is OFF (`sudo bash gc2607-suspend-hibernate.sh disable`). This plan is how to find
 out why resume hangs so it can be switched back on. Evidence and history: top block of
 `docs/incidents/2026-05-silent-freezes.md`.
 
@@ -8,6 +8,29 @@ out why resume hangs so it can be switched back on. Evidence and history: top bl
 next morning's RESUME hung and needed a power-button hold (`gc2607-hib-image-probe.py`, see the incident note). The
 earlier record: 09-11 a resumed session died 64 s after resume; 07-01 one unexplained no-resume. Nothing can be logged
 during a resume, so the cause is unknown. Do not guess one; the steps below each remove one suspect.
+
+**Status (2026-10-09):** the same resume hang happened again (complete image, resume hung), and the record now splits
+by power source: every cold resume on AC worked (6/6), both on battery hung (0/2). Steps 1-3 below were only ever run
+on AC. Step 0 tests the battery case first. Hibernate is OFF until Step 0 passes.
+
+## Step 0: resume on battery (2026-10-09)
+
+Needs: one reboot after 2026-10-09, so the early SN740 ASPM rule is live in the initramfs. Each cycle can end in a
+power-button hold; the boot after a hang triages itself and probes the image (`/var/log/gc2607-crash-triage/`).
+
+1. `sudo bash gc2607-nvme-aspm.sh status`: `boot record` must show `gc2607-sn740-aspm: firmware left l1_aspm=..`.
+   `sudo bash gc2607-hibernate-test.sh status`: every initramfs line `present`.
+2. `sudo bash gc2607-hibernate-test.sh step2-prep`, then reboot (turns hibernate on, shows the console on resume).
+3. Unplug the charger. `sudo bash gc2607-hibernate-test.sh step2-run battery`. When it is off, press power with the
+   charger still out.
+   - **Resumes:** repeat twice more on battery. Three in a row under one configuration is the bar for turning hibernate
+     back on (`gc2607-suspend-hibernate.sh install 90min`), recorded in the incident note.
+   - **Hangs:** photograph the screen, hold power, boot, read the newest `triage-report.txt` and `hib-image-probe.txt`.
+     Then `sudo bash gc2607-hibernate-test.sh step3-shutdown` and repeat 3 on battery: firmware S4 is then bypassed.
+     Resumes only in `shutdown` mode -> the firmware's S4 path on battery; keep `HibernateMode=shutdown` as the fix.
+     Hangs in both -> the image-loading kernel on battery; compare the `gc2607-sn740-aspm` boot records on AC and
+     battery (`journalctl -k -g gc2607-sn740-aspm`) before anything else.
+4. `sudo bash gc2607-hibernate-test.sh cleanup` always (it turns hibernate OFF again).
 
 ## Preconditions (every step)
 

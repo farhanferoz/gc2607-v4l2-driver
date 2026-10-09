@@ -9,8 +9,11 @@
 #                   Isolates whether the kernel/driver restore path works.
 #   step2-prep      Prepare Step 2: enable hibernate drop-ins, set no_console_suspend
 #                   via grubby, and prompt for reboot.
-#   step2-run       Execute Step 2: re-apply debug switches and run systemctl hibernate.
+#   step2-run [ac|battery]  Execute Step 2: re-apply debug switches and run systemctl hibernate.
+#                   `battery` requires the charger OUT (2026-10-09: every cold resume on AC worked,
+#                   both on battery hung; every earlier test had run on AC only).
 #   step3-shutdown  Force HibernateMode=shutdown (bypasses firmware S4).
+#   probe [ARGS]    Read-only: gc2607-hib-image-probe.py as root (ARGS: releases/strings to find, --all).
 #   cleanup         Revert grubby console args, remove sleep overrides, unpause Docker.
 #   status          Read-only check of power, resume targets, and debug switches.
 #
@@ -45,6 +48,16 @@ check_ac() {
     echo "ERROR: Laptop is not plugged into AC power. Plug in AC before testing." >&2
     exit 1
   fi
+}
+
+check_on_battery() {
+  local f
+  for f in /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online; do
+    if [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "1" ]; then
+      echo "ERROR: the charger is connected. Unplug it for the battery test." >&2
+      exit 1
+    fi
+  done
 }
 
 check_resume_targets() {
@@ -97,6 +110,21 @@ case "$CMD" in
     echo "pm_async: $(cat /sys/power/pm_async 2>/dev/null || echo missing)"
     echo "pm_print_times: $(cat /sys/power/pm_print_times 2>/dev/null || echo missing)"
     echo "pm_debug_messages: $(cat /sys/power/pm_debug_messages 2>/dev/null || echo missing)"
+    # The kernel that LOADS the image is a fresh boot running only the initramfs: settings applied
+    # later in boot (sysctl.d, gc2607-nvme-aspm.service) do not reach it unless the initramfs has them.
+    echo "--- image-loading kernel (initramfs of $(uname -r)) ---"
+    echo "panic= on cmdline: $(grep -oE '(^| )panic=[0-9]+' /proc/cmdline || echo 'none -> CONFIG_PANIC_TIMEOUT')  ($(grep -h '^CONFIG_PANIC_TIMEOUT' "/boot/config-$(uname -r)"))"
+    if [ "$(id -u)" -eq 0 ] && command -v lsinitrd >/dev/null 2>&1; then
+      INITRD_LIST=$(lsinitrd "/boot/initramfs-$(uname -r).img" 2>&1)
+      echo "  listing: $(wc -l <<< "$INITRD_LIST") lines"
+      # usr/lib/systemd/systemd is a CONTROL: it must read present, or the listing itself failed. Match with
+      # a here-string: piping into grep -q made printf take SIGPIPE, and pipefail turned every hit ABSENT.
+      for f in usr/lib/systemd/systemd etc/sysctl.d/99-crash-debug.conf usr/lib/systemd/systemd-sysctl etc/udev/rules.d/05-gc2607-sn740-aspm.rules usr/bin/sh usr/bin/cat; do
+        printf '  %-40s %s\n' "$f" "$(grep -qE " $f( -> .*)?\$" <<< "$INITRD_LIST" && echo present || echo ABSENT)"
+      done
+    else
+      echo "  (run as root to list the initramfs)"
+    fi
     if command -v docker >/dev/null 2>&1; then
       echo "Docker containers:"
       docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Status}}"
@@ -156,7 +184,8 @@ case "$CMD" in
 
   step2-run)
     need_root "$@"
-    check_ac
+    if [ "${2:-ac}" = battery ]; then check_on_battery; else check_ac; fi
+    logger -t gc2607-hibernate-test "step2-run power=${2:-ac} disk_mode=$(cat /sys/power/disk)"
     check_resume_targets
     arm_debug_switches
 
@@ -180,6 +209,12 @@ case "$CMD" in
     echo "Now test with: sudo bash $0 step2-run"
     ;;
 
+  probe)
+    need_root "$@"
+    shift
+    exec python3 -I "$(dirname "$(readlink -f "$0")")/gc2607-hib-image-probe.py" "$@"
+    ;;
+
   cleanup)
     need_root "$@"
     echo "=== Cleaning Up Test Configurations ==="
@@ -192,11 +227,14 @@ case "$CMD" in
     fi
 
     unpause_docker
+    # Hibernate stays OFF unless the owner turns it on (workspace-sync D134); step2-prep turned it on.
+    echo "Turning hibernate back OFF (lid -> plain suspend); turn on deliberately with: gc2607-suspend-hibernate.sh enable"
+    bash "$SCRIPT_DIR/gc2607-suspend-hibernate.sh" disable
     echo "Cleanup complete."
     ;;
 
   *)
-    echo "Usage: sudo bash $0 {step1|step2-prep|step2-run|step3-shutdown|cleanup|status}" >&2
+    echo "Usage: sudo bash $0 {step1|step2-prep|step2-run|step3-shutdown|probe|cleanup|status}" >&2
     exit 2
     ;;
 esac
