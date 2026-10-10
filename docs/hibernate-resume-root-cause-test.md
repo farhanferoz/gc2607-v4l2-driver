@@ -15,6 +15,11 @@ on AC. Step 0 tests the battery case first. Hibernate is OFF until Step 0 passes
 
 ## Step 0: resume on battery (2026-10-09)
 
+**Result so far (2026-10-10, kernel 7.2.9, early SN740 rule live, firmware had left L1 on at every boot):** 2 of 2
+cold resumes on battery PASSED (10:21:20 -> 10:23:25 and 10:55:49 -> 10:57:05), each a real restore (no image-writing
+lines survive in the restored log, owner pressed power) and each survived the 10-minute post-wake window. Before
+the rule: 0 of 2 on battery. The bar is 3 in a row, so cycle 3 is still owed; `cleanup` ran and hibernate is OFF.
+
 Needs: one reboot after 2026-10-09, so the early SN740 ASPM rule is live in the initramfs. Each cycle can end in a
 power-button hold; the boot after a hang triages itself and probes the image (`/var/log/gc2607-crash-triage/`).
 
