@@ -18,7 +18,7 @@ on AC. Step 0 tests the battery case first. Hibernate is OFF until Step 0 passes
 Needs: one reboot after 2026-10-09, so the early SN740 ASPM rule is live in the initramfs. Each cycle can end in a
 power-button hold; the boot after a hang triages itself and probes the image (`/var/log/gc2607-crash-triage/`).
 
-1. `sudo bash gc2607-nvme-aspm.sh status`: `boot record` must show `gc2607-sn740-aspm: firmware left l1_aspm=..`.
+1. `sudo bash gc2607-nvme-aspm.sh status`: `boot record` must show `firmware left l1_aspm=..`.
    `sudo bash gc2607-hibernate-test.sh status`: every initramfs line `present`.
 2. `sudo bash gc2607-hibernate-test.sh step2-prep`, then reboot (turns hibernate on, shows the console on resume).
 3. Unplug the charger. `sudo bash gc2607-hibernate-test.sh step2-run battery`. When it is off, press power with the
@@ -29,7 +29,7 @@ power-button hold; the boot after a hang triages itself and probes the image (`/
      Then `sudo bash gc2607-hibernate-test.sh step3-shutdown` and repeat 3 on battery: firmware S4 is then bypassed.
      Resumes only in `shutdown` mode -> the firmware's S4 path on battery; keep `HibernateMode=shutdown` as the fix.
      Hangs in both -> the image-loading kernel on battery; compare the `gc2607-sn740-aspm` boot records on AC and
-     battery (`journalctl -k -g gc2607-sn740-aspm`) before anything else.
+     battery (`journalctl -t gc2607-sn740-aspm`) before anything else.
 4. `sudo bash gc2607-hibernate-test.sh cleanup` always (it turns hibernate OFF again).
 
 ## Preconditions (every step)

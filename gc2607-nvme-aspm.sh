@@ -49,7 +49,9 @@ status() {
   if [ "$(id -u)" -eq 0 ]; then
     echo "  in initramfs = $(lsinitrd "/boot/initramfs-$(uname -r).img" 2>/dev/null | grep -c "${RULE#/}\$") (1 = present)"
   fi
-  echo "  boot record  = $(journalctl -b -k -o cat --no-pager 2>/dev/null | grep -m1 'gc2607-sn740-aspm' || echo 'none this boot')"
+  # journald files a udev RUN's /dev/kmsg line under its tag, not the kernel transport, so -k never sees it.
+  # The first line is the initramfs (the kernel that loads a hibernate image), the second the real root.
+  echo "  boot record  = $(journalctl -b -t gc2607-sn740-aspm -o cat --no-pager 2>/dev/null | paste -sd'|' | sed 's/|/ | /g' | grep . || echo 'none this boot')"
 }
 
 need_root() { [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@"; }
