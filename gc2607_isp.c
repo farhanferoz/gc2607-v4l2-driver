@@ -314,8 +314,11 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
     /* BT.601 limited ("studio") range: Y 16-235, U/V 16-240, what YUYV consumers assume. */
     int y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16;
     int y1 = ((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16;
-    int u  = ((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8);
-    int v  = ((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8);
+    /* The pair shares one U and V: take them from the pair's average colour (sums, >> 9),
+     * not from the first pixel alone, which coloured every edge from one side. */
+    int r = r0 + r1, g = g0 + g1, b = b0 + b1;
+    int u  = ((-38 * r - 74 * g + 112 * b + 256) >> 9);
+    int v  = ((112 * r - 94 * g - 18 * b + 256) >> 9);
     /* Stand-in for the colour-correction matrix this ISP never had (recorded as the open
      * colour-accuracy gap in docs/archive/PROJECT_HISTORY.md): a raw sensor's colours are
      * muddier than the eye's, and the missing CCM is mostly a saturation lift. */

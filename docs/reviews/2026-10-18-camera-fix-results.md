@@ -110,3 +110,10 @@ tools/baseline_metrics.json /home/ff235/cache/gc2607/replay/q2_metrics.json`), s
 | texture_e600_g4 | 0.292 -> 0.419 | 0.0142 -> 0.0099 | 0.544 -> 0.619 |
 
 The darkest quarter rises on every capture and clipping never rises (the bar was at most +1 point).
+
+## Q3a Chroma from both pixels of a pair (2026-10-18)
+
+`rgb_to_yuyv()` takes U and V from the pair's summed colour (`>> 9`, rounded). New `tests/test_output.c`: the pair
+(255,0,0), (0,0,255) gives U 174 and V 186, the chroma of (127.5, 0, 127.5) with this ISP's 1.25x chroma gain
+(174.1 and 186.5), within 1. The same test against the Q2 commit's `gc2607_isp.c` FAILS with U 81 and V 240 (the red
+pixel's chroma alone).
