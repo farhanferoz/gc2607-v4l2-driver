@@ -117,3 +117,24 @@ The darkest quarter rises on every capture and clipping never rises (the bar was
 (255,0,0), (0,0,255) gives U 174 and V 186, the chroma of (127.5, 0, 127.5) with this ISP's 1.25x chroma gain
 (174.1 and 186.5), within 1. The same test against the Q2 commit's `gc2607_isp.c` FAILS with U 81 and V 240 (the red
 pixel's chroma alone).
+
+## Q3b Full 1920x1080 output (2026-10-18)
+
+New `demosaic_full()`: bilinear GRBG demosaic written rotated straight into a 1920x1080 YUYV frame, reading three
+padded line buffers (rows and columns reflect by two at the borders, so edge pixels keep the right colour). The
+statistics moved into `collect_stats()`, with the same half-resolution sampling as before; the binning path is
+`bin_half()` behind `GC2607_ISP_HALF_RES=1` (also honoured by `tools/isp_replay.c`). `CPUAffinity=0-19` in the unit.
+
+- Fallback identity: `GC2607_ISP_HALF_RES=1 build/isp_replay` vs the Q3a commit's replay on all 18 corpus frames:
+  18 identical `.yuyv` and `.json` files, 0 different (so the statistics refactor changed nothing).
+- `make test`: test_lut ok, test_output ok (uniform frame: all 1,036,800 pairs identical; grey step at column 960:
+  colour only in output pairs 479-480; rotation). Mutations: clamping the padded columns instead of reflecting fails
+  the uniform check (1080 pairs); widening one interpolation tap fails both (540 pairs each).
+- `make bench` (median of 200): full 10.42 ms on cpu 0 (bar 13), 20.44 ms on cpu 12 (bar 22), 33.67 ms on cpu 20
+  (over 33 ms, hence the affinity); binned 8.74 / 14.54 / 24.69 ms.
+- Corpus, mean chroma magnitude in the centre half (`false_colour`), baseline -> Q3b: texture 7.12 -> 6.19 (bar <=
+  1.2x baseline: met). Against Q2 at half resolution, full resolution raises it 1.1-1.4x in room light (normal
+  3.86 -> 5.24) and 2-6x in the darkest captures, with luma noise unchanged: chroma noise that binning and the
+  median used to average away. A side-by-side crop of normal_e600_g4 shows a visibly sharper face with faint colour
+  speckle on skin. Those frames were taken at 2x gain; Q1 should bring room-light gain to 1x, so re-measure after Q1
+  before adding a chroma filter.

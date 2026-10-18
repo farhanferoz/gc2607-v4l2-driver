@@ -20,6 +20,9 @@ ExecStartPost=/opt/gc2607/gc2607-restart-wireplumber.sh
 # sleep ends it with 0, which on-failure does not restart either.
 Restart=on-failure
 RestartSec=5
+# Off the low-power cores 20-21 (1.0 GHz, `lscpu -e`): a full-resolution frame took 33.7 ms
+# there (`make bench`, 2026-10-18), over the 33 ms a 30 fps frame allows.
+CPUAffinity=0-19
 TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal

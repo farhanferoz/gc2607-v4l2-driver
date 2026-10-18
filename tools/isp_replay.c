@@ -4,7 +4,8 @@
  *   isp_replay RAW_FILE OUT_PREFIX [FRAME]
  *
  * Writes OUT_PREFIX.yuyv (the exact bytes the ISP would send to /dev/video50) and OUT_PREFIX.json
- * (size and the controls used). FRAME defaults to the last frame in the file.
+ * (size and the controls used). FRAME defaults to the last frame in the file. The output size follows
+ * GC2607_ISP_HALF_RES as in the service (1 = 960x540 binned, otherwise 1920x1080).
  *
  * White balance and software brightness are the values today's streaming loop settles at for this
  * frame: grey-world gains, and min(mean target, highlight cap) from the frame's own statistics (both
@@ -41,6 +42,7 @@ int main(int argc, char **argv)
         return 1;
     }
     fclose(f);
+    select_output_size();
 
     float r_mean, g_mean, b_mean;
     uint32_t hist[HISTOGRAM_BINS];
@@ -78,7 +80,7 @@ int main(int argc, char **argv)
     char path[4096];
     snprintf(path, sizeof(path), "%s.yuyv", argv[2]);
     FILE *o = fopen(path, "wb");
-    if (!o || fwrite(yuyv_buf, sizeof(yuyv_buf), 1, o) != 1) {
+    if (!o || fwrite(yuyv_buf, out_bytes(), 1, o) != 1) {
         perror(path);
         return 1;
     }
@@ -91,7 +93,7 @@ int main(int argc, char **argv)
     }
     fprintf(o, "{\"width\": %d, \"height\": %d, \"frame\": %ld, \"r_gain\": %.3f, \"b_gain\": %.3f, "
                "\"brightness\": %.3f, \"bright_for_mean\": %.3f, \"bright_for_cap\": %.3f}\n",
-            OUT_W, OUT_H, frame, r_gain, b_gain, brightness, bright_for_mean, bright_for_cap);
+            out_w, out_h, frame, r_gain, b_gain, brightness, bright_for_mean, bright_for_cap);
     fclose(o);
     return 0;
 }

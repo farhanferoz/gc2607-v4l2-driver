@@ -40,8 +40,8 @@
 /* Sensor parameters */
 #define SENSOR_W        1920
 #define SENSOR_H        1080
-#define OUT_W           (SENSOR_W / 2)  /* 960 */
-#define OUT_H           (SENSOR_H / 2)  /* 540 */
+#define HALF_W          (SENSOR_W / 2)  /* 960: 2x2-binned output and the statistics grid */
+#define HALF_H          (SENSOR_H / 2)  /* 540 */
 #define FRAME_PIXELS    (SENSOR_W * SENSOR_H)
 #define LUT_SIZE        1024  /* 10-bit sensor values 0..1023 */
 
@@ -98,13 +98,13 @@
  * range, which is the only reliable way to handle bright-background +
  * shadowed-subject scenes without a multi-shot HDR sensor.
  *
- * Grid is OUT_W/OUT_H downsampled by ~16; bilinearly upsampled when
+ * Grid is HALF_W/HALF_H downsampled by ~16; bilinearly upsampled when
  * applied. Temporal EMA prevents per-frame flicker.
  */
-#define LTM_GRID_X          60          /* ~OUT_W/16 */
-#define LTM_GRID_Y          34          /* ~OUT_H/16 (rounded up) */
-#define LTM_CELL_W          (OUT_W / LTM_GRID_X)
-#define LTM_CELL_H          ((OUT_H + LTM_GRID_Y - 1) / LTM_GRID_Y)
+#define LTM_GRID_X          60          /* ~HALF_W/16 */
+#define LTM_GRID_Y          34          /* ~HALF_H/16 (rounded up) */
+#define LTM_CELL_W          (HALF_W / LTM_GRID_X)
+#define LTM_CELL_H          ((HALF_H + LTM_GRID_Y - 1) / LTM_GRID_Y)
 #define LTM_TARGET_Y        128.0f      /* compress bright cells toward this Y */
 #define LTM_KNEE            120.0f      /* cells with mean Y below this: identity */
 #define LTM_STRENGTH        0.7f        /* 0=no compression, 1=hard */
@@ -158,8 +158,20 @@ static uint8_t lut_r[LUT_SIZE];
 static uint8_t lut_g[LUT_SIZE];
 static uint8_t lut_b[LUT_SIZE];
 
-/* Output YUYV buffer (960x540x2 bytes) */
-static uint8_t yuyv_buf[OUT_W * OUT_H * 2];
+/* Output: full 1920x1080 YUYV, or the 960x540 binned fallback with GC2607_ISP_HALF_RES=1. */
+static int half_res;
+static int out_w = SENSOR_W, out_h = SENSOR_H;
+static uint8_t yuyv_buf[SENSOR_W * SENSOR_H * 2];   /* the first out_w * out_h * 2 bytes are used */
+
+static void select_output_size(void)
+{
+    const char *v = getenv("GC2607_ISP_HALF_RES");
+    half_res = v && strcmp(v, "1") == 0;
+    out_w = half_res ? HALF_W : SENSOR_W;
+    out_h = half_res ? HALF_H : SENSOR_H;
+}
+
+static size_t out_bytes(void) { return (size_t)out_w * out_h * 2; }
 
 static void signal_handler(int sig)
 {
@@ -260,8 +272,8 @@ static void chroma_median_filter(uint8_t *buf, int width, int height)
 
     /* Two saved rows of pre-modification chroma so the median sees the
      * original neighbours regardless of in-place writes above. ~1.9 KB. */
-    static uint8_t above_u[OUT_W / 2], above_v[OUT_W / 2];
-    static uint8_t current_u[OUT_W / 2], current_v[OUT_W / 2];
+    static uint8_t above_u[HALF_W / 2], above_v[HALF_W / 2];
+    static uint8_t current_u[HALF_W / 2], current_v[HALF_W / 2];
 
     /* Seed: above = row 0 (left untouched), current = row 1 (about to be processed). */
     for (int i = 0; i < npairs; i++) {
@@ -332,57 +344,163 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
 }
 
 /*
- * Process one Bayer frame -> YUYV output with 180 degree rotation.
- *
- * Bayer GRBG pattern:
- *   Row 0: G R G R G R ...
- *   Row 1: B G B G B G ...
- *
- * 2x2 binning: each 2x2 block -> one output pixel (R, avg(G1,G2), B).
- * 180 degree rotation: output rows/cols are reversed.
- *
- * Returns the subsampled green mean for AE.
- */
-/*
- * Per-frame multi-zone AE accumulators. Populated during process_frame's
- * stat-pixel sweep; consumed by compute_ae_zone_target() in the main loop.
+ * Per-frame multi-zone AE accumulators. Populated by collect_stats();
+ * consumed by compute_ae_zone_target() in the main loop.
  */
 static uint64_t ae_zone_g_sum[AE_ZONES];
 static uint32_t ae_zone_g_count[AE_ZONES];
 
-static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
-                           float brightness, float *out_r_sum, float *out_g_sum,
-                           float *out_b_sum,
-                           uint32_t *out_g_hist, int *out_hist_total,
-                           int *out_count)
+/*
+ * White-balance and exposure statistics from every WB_SUBSAMPLE-th 2x2 Bayer block in each
+ * direction: the half-resolution sampling the controllers were tuned on, whatever the output
+ * size. Zones are in rotated half-resolution coordinates, as when this ran inside the binning loop.
+ */
+static void collect_stats(const uint16_t *bayer, float *out_r_sum, float *out_g_sum,
+                          float *out_b_sum, uint32_t *out_g_hist, int *out_hist_total,
+                          int *out_count)
 {
-    /* Green gain is always 1.0 in gray-world WB */
-    build_luts(r_gain, 1.0f, b_gain, brightness);
-
     double r_sum = 0, g_sum = 0, b_sum = 0;
     int stat_count = 0;
     int hist_total = 0;
-    for (int i = 0; i < HISTOGRAM_BINS; i++) out_g_hist[i] = 0;
-    for (int i = 0; i < AE_ZONES; i++) {
-        ae_zone_g_sum[i] = 0;
-        ae_zone_g_count[i] = 0;
+    memset(out_g_hist, 0, HISTOGRAM_BINS * sizeof(*out_g_hist));
+    memset(ae_zone_g_sum, 0, sizeof(ae_zone_g_sum));
+    memset(ae_zone_g_count, 0, sizeof(ae_zone_g_count));
+
+    for (int oy = 0; oy < HALF_H; oy += WB_SUBSAMPLE) {
+        const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
+        const uint16_t *row1 = row0 + SENSOR_W;
+        int out_y = HALF_H - 1 - oy;
+
+        for (int ox = 0; ox < HALF_W; ox += WB_SUBSAMPLE) {
+            int r = row0[ox * 2 + 1], b = row1[ox * 2];
+            int g = (row0[ox * 2] + row1[ox * 2 + 1]) >> 1;
+            if (r >= LUT_SIZE) r = LUT_SIZE - 1;
+            if (g >= LUT_SIZE) g = LUT_SIZE - 1;
+            if (b >= LUT_SIZE) b = LUT_SIZE - 1;
+
+            /* Histogram: every sampled pixel including saturated ones —
+             * the highlight cap explicitly needs to see clipped values. */
+            int hbin = g / HIST_BIN_WIDTH;
+            if (hbin >= HISTOGRAM_BINS) hbin = HISTOGRAM_BINS - 1;
+            out_g_hist[hbin]++;
+            hist_total++;
+
+            /* WB / mean stats: skip saturated — clipped values hide the
+             * true channel ratio, causing AWB to underestimate green
+             * dominance in bright scenes. */
+            if (r < 1020 && g < 1020 && b < 1020) {
+                float rv = fmaxf((float)r - BLACK_LEVEL, 0.0f);
+                float gv = fmaxf((float)g - BLACK_LEVEL, 0.0f);
+                float bv = fmaxf((float)b - BLACK_LEVEL, 0.0f);
+                r_sum += rv;
+                g_sum += gv;
+                b_sum += bv;
+                stat_count++;
+
+                /* Multi-zone AE: accumulate green into the right zone of a 16x16 grid. */
+                int zx = (HALF_W - 2 - ox) * AE_ZONES_X / HALF_W;
+                int zy = out_y * AE_ZONES_Y / HALF_H;
+                if (zx >= AE_ZONES_X) zx = AE_ZONES_X - 1;
+                if (zy >= AE_ZONES_Y) zy = AE_ZONES_Y - 1;
+                int zidx = zy * AE_ZONES_X + zx;
+                ae_zone_g_sum[zidx] += (uint64_t)gv;
+                ae_zone_g_count[zidx]++;
+            }
+        }
     }
 
-    /*
-     * Iterate output pixels in reverse for 180 degree rotation.
-     * Output row (OUT_H-1-oy) col (OUT_W-1-ox) maps to Bayer block at (oy*2, ox*2).
-     */
-    for (int oy = 0; oy < OUT_H; oy++) {
+    if (stat_count > 0) {
+        *out_r_sum = (float)(r_sum / stat_count);
+        *out_g_sum = (float)(g_sum / stat_count);
+        *out_b_sum = (float)(b_sum / stat_count);
+    } else {
+        *out_r_sum = *out_g_sum = *out_b_sum = 0.0f;
+    }
+    *out_count = stat_count;
+    *out_hist_total = hist_total;
+}
+
+/*
+ * Copy one Bayer row into a line buffer with one extra column each side, clamped to 10 bits.
+ * Column -1 reflects to column 1 and column W to W-2, which keep the Bayer colour.
+ */
+static inline void load_padded_row(uint16_t *dst, const uint16_t *src)
+{
+    for (int c = 0; c < SENSOR_W; c++)
+        dst[c + 1] = src[c] < LUT_SIZE ? src[c] : LUT_SIZE - 1;
+    dst[0] = dst[2];
+    dst[SENSOR_W + 1] = dst[SENSOR_W - 1];
+}
+
+/*
+ * Full-resolution bilinear demosaic of GRBG straight into the 1920x1080 YUYV output, rotated
+ * 180 degrees in the same pass. The interpolation follows demosaic_full() in
+ * github.com/antonbiluta/gc2607-driver (fd3ea57); this version reads three padded line buffers
+ * instead of clamping every access, and reflects rows and columns by two so the outermost
+ * pixels interpolate from the right colour.
+ *
+ *   even rows: G R G R ...     odd rows: B G B G ...
+ */
+static void demosaic_full(const uint16_t *bayer)
+{
+    static uint16_t lines[3][SENSOR_W + 2];
+
+    load_padded_row(lines[0], bayer);
+    load_padded_row(lines[1], bayer + SENSOR_W);
+    for (int r = 0; r < SENSOR_H; r++) {
+        if (r >= 1 && r + 1 < SENSOR_H)
+            load_padded_row(lines[(r + 1) % 3], bayer + (r + 1) * SENSOR_W);
+        /* Row -1 reflects to row 1 and row H to row H-2 (same parity). */
+        const uint16_t *U = lines[(r == 0 ? 1 : r - 1) % 3] + 1;
+        const uint16_t *C = lines[r % 3] + 1;
+        const uint16_t *D = lines[(r + 1 < SENSOR_H ? r + 1 : r - 1) % 3] + 1;
+        uint8_t *out_row = yuyv_buf + (SENSOR_H - 1 - r) * SENSOR_W * 2;
+
+        /* Source pixels c and c+1 land at output x W-1-c and W-2-c: one YUYV pair, swapped. */
+        if ((r & 1) == 0) {
+            for (int c = 0; c < SENSOR_W; c += 2) {
+                int g0 = C[c];
+                int r0 = (C[c - 1] + C[c + 1] + 1) >> 1;
+                int b0 = (U[c] + D[c] + 1) >> 1;
+                int r1 = C[c + 1];
+                int g1 = (C[c] + C[c + 2] + U[c + 1] + D[c + 1] + 2) >> 2;
+                int b1 = (U[c] + U[c + 2] + D[c] + D[c + 2] + 2) >> 2;
+                rgb_to_yuyv(lut_r[r1], lut_g[g1], lut_b[b1], lut_r[r0], lut_g[g0], lut_b[b0],
+                            out_row + (SENSOR_W - 2 - c) * 2);
+            }
+        } else {
+            for (int c = 0; c < SENSOR_W; c += 2) {
+                int b0 = C[c];
+                int g0 = (C[c - 1] + C[c + 1] + U[c] + D[c] + 2) >> 2;
+                int r0 = (U[c - 1] + U[c + 1] + D[c - 1] + D[c + 1] + 2) >> 2;
+                int g1 = C[c + 1];
+                int r1 = (U[c + 1] + D[c + 1] + 1) >> 1;
+                int b1 = (C[c] + C[c + 2] + 1) >> 1;
+                rgb_to_yuyv(lut_r[r1], lut_g[g1], lut_b[b1], lut_r[r0], lut_g[g0], lut_b[b0],
+                            out_row + (SENSOR_W - 2 - c) * 2);
+            }
+        }
+    }
+}
+
+/*
+ * 2x2 binning to the 960x540 fallback output (GC2607_ISP_HALF_RES=1), with 180 degree rotation.
+ * Each 2x2 GRBG block -> one output pixel (R, avg(G1,G2), B).
+ * Output row (HALF_H-1-oy) col (HALF_W-1-ox) maps to Bayer block at (oy*2, ox*2).
+ */
+static void bin_half(const uint16_t *bayer)
+{
+    for (int oy = 0; oy < HALF_H; oy++) {
         /* Bayer row pointers for this 2x2 block row */
         const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
         const uint16_t *row1 = bayer + (oy * 2 + 1) * SENSOR_W;
 
         /* Output row (flipped) */
-        int out_y = OUT_H - 1 - oy;
-        uint8_t *out_row = yuyv_buf + out_y * OUT_W * 2;
+        int out_y = HALF_H - 1 - oy;
+        uint8_t *out_row = yuyv_buf + out_y * HALF_W * 2;
 
         /* Process pairs of output pixels for YUYV packing */
-        for (int ox = 0; ox < OUT_W; ox += 2) {
+        for (int ox = 0; ox < HALF_W; ox += 2) {
             int bx0 = ox * 2;
             int bx1 = (ox + 1) * 2;
 
@@ -415,64 +533,34 @@ static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
             uint8_t R1 = lut_r[r_1],  G1 = lut_g[gavg_1], B1 = lut_b[b_1];
 
             /* Write YUYV (flipped horizontally too for 180 degree rotation) */
-            int out_x = OUT_W - 2 - ox;
+            int out_x = HALF_W - 2 - ox;
             /* Swap pixel order within the pair for horizontal flip */
             rgb_to_yuyv(R1, G1, B1, R0, G0, B0, out_row + out_x * 2);
-
-            /* Accumulate WB + AE statistics (subsampled). */
-            if ((oy & (WB_SUBSAMPLE - 1)) == 0 && (ox & (WB_SUBSAMPLE - 1)) == 0) {
-                /* Histogram: every sampled pixel including saturated ones —
-                 * the highlight cap explicitly needs to see clipped values. */
-                int hbin = gavg_0 / HIST_BIN_WIDTH;
-                if (hbin >= HISTOGRAM_BINS) hbin = HISTOGRAM_BINS - 1;
-                out_g_hist[hbin]++;
-                hist_total++;
-
-                /* WB / mean stats: skip saturated — clipped values hide the
-                 * true channel ratio, causing AWB to underestimate green
-                 * dominance in bright scenes. */
-                if (r_0 < 1020 && gavg_0 < 1020 && b_0 < 1020) {
-                    float rv = (float)r_0 - BLACK_LEVEL;
-                    float gv = (float)gavg_0 - BLACK_LEVEL;
-                    float bv = (float)b_0 - BLACK_LEVEL;
-                    if (rv < 0) rv = 0;
-                    if (gv < 0) gv = 0;
-                    if (bv < 0) bv = 0;
-                    r_sum += rv;
-                    g_sum += gv;
-                    b_sum += bv;
-                    stat_count++;
-
-                    /* Multi-zone AE: accumulate green into the right zone.
-                     * Output coordinates (out_x in [0, OUT_W), out_y in
-                     * [0, OUT_H)) get mapped to a 16x16 grid. */
-                    int zx = out_x * AE_ZONES_X / OUT_W;
-                    int zy = out_y * AE_ZONES_Y / OUT_H;
-                    if (zx >= AE_ZONES_X) zx = AE_ZONES_X - 1;
-                    if (zy >= AE_ZONES_Y) zy = AE_ZONES_Y - 1;
-                    int zidx = zy * AE_ZONES_X + zx;
-                    ae_zone_g_sum[zidx] += (uint64_t)gv;
-                    ae_zone_g_count[zidx]++;
-                }
-            }
         }
-
     }
 
     /* False-colour suppression: 3x3 chroma median over the YUYV buffer.
      * Y is untouched so luma sharpness is preserved. */
-    chroma_median_filter(yuyv_buf, OUT_W, OUT_H);
+    chroma_median_filter(yuyv_buf, HALF_W, HALF_H);
+}
 
-    if (stat_count > 0) {
-        *out_r_sum = (float)(r_sum / stat_count);
-        *out_g_sum = (float)(g_sum / stat_count);
-        *out_b_sum = (float)(b_sum / stat_count);
-    } else {
-        *out_r_sum = *out_g_sum = *out_b_sum = 0.0f;
-    }
-    *out_count = stat_count;
-    *out_hist_total = hist_total;
-
+/*
+ * Process one Bayer frame -> YUYV in yuyv_buf (out_w x out_h, rotated 180 degrees), and return
+ * the statistics for white balance and exposure. Returns the subsampled green mean.
+ */
+static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
+                           float brightness, float *out_r_sum, float *out_g_sum,
+                           float *out_b_sum,
+                           uint32_t *out_g_hist, int *out_hist_total,
+                           int *out_count)
+{
+    /* Green gain is always 1.0 in gray-world WB */
+    build_luts(r_gain, 1.0f, b_gain, brightness);
+    collect_stats(bayer, out_r_sum, out_g_sum, out_b_sum, out_g_hist, out_hist_total, out_count);
+    if (half_res)
+        bin_half(bayer);
+    else
+        demosaic_full(bayer);
     return *out_g_sum;
 }
 
@@ -852,11 +940,11 @@ static int open_output(const char *dev)
 
     struct v4l2_format fmt = {0};
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    fmt.fmt.pix.width = OUT_W;
-    fmt.fmt.pix.height = OUT_H;
+    fmt.fmt.pix.width = out_w;
+    fmt.fmt.pix.height = out_h;
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix.sizeimage = OUT_W * OUT_H * 2;
+    fmt.fmt.pix.sizeimage = out_bytes();
     if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
         perror("VIDIOC_S_FMT output");
         close(fd);
@@ -1058,7 +1146,7 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         return -1;
 
     printf("[gc2607_isp] Streaming started (output %dx%d YUYV, exp=%d gain=%d bright=%.2f)\n",
-           OUT_W, OUT_H, cur_exposure, cur_gain, brightness);
+           out_w, out_h, cur_exposure, cur_gain, brightness);
 
     int frame_count = 0;
     int no_consumer_count = 0;
@@ -1208,7 +1296,7 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         }
 
         /* Write YUYV to v4l2loopback */
-        ssize_t written = write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+        ssize_t written = write(out_fd, yuyv_buf, out_bytes());
         if (written < 0 && errno != EAGAIN) {
             perror("write output");
             break;
@@ -1266,8 +1354,9 @@ int main(int argc, char *argv[])
     /* Line-buffered stdout so logs appear in journald */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    printf("[gc2607_isp] Starting with lazy activation (capture=%s output=%s)\n",
-           capture_dev, output_dev);
+    select_output_size();
+    printf("[gc2607_isp] Starting with lazy activation (capture=%s output=%s %dx%d)\n",
+           capture_dev, output_dev, out_w, out_h);
 
     /* sigaction without SA_RESTART: glibc's signal() restarts interrupted calls,
      * which is how a SIGTERM used to wait out the whole stop timeout. */
@@ -1310,15 +1399,14 @@ int main(int argc, char *argv[])
      */
 
     /* Prepare a black standby frame (Y=16, U=128, V=128 = black in YUYV) */
-    memset(yuyv_buf, 0, sizeof(yuyv_buf));
-    for (size_t i = 0; i < sizeof(yuyv_buf); i += 4) {
+    for (size_t i = 0; i < out_bytes(); i += 4) {
         yuyv_buf[i]     = 16;   /* Y0 */
         yuyv_buf[i + 1] = 128;  /* U  */
         yuyv_buf[i + 2] = 16;   /* Y1 */
         yuyv_buf[i + 3] = 128;  /* V  */
     }
     /* Write initial standby frame so wireplumber can probe successfully */
-    write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+    write(out_fd, yuyv_buf, out_bytes());
 
     printf("[gc2607_isp] Idle, waiting for consumers on %s...\n", output_dev);
 
@@ -1364,7 +1452,7 @@ int main(int argc, char *argv[])
                        output_dev);
         } else {
             /* Write standby frame to keep v4l2loopback alive */
-            write(out_fd, yuyv_buf, sizeof(yuyv_buf));
+            write(out_fd, yuyv_buf, out_bytes());
         }
     }
 
