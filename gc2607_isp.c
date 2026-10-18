@@ -2,6 +2,7 @@
  * gc2607_isp.c — Lightweight userspace ISP for GC2607 camera sensor
  *
  * Captures raw 10-bit Bayer GRBG from V4L2, applies:
+ *   - Lens-shading correction of the raw rows as they are read (gc2607_lsc_table.h)
  *   - Bilinear demosaic to 1920x1080 (2x2 binning to 960x540 with GC2607_ISP_HALF_RES=1)
  *   - Black level subtraction
  *   - Gray-world auto white balance
@@ -32,6 +33,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
+
+#include "gc2607_lsc_table.h"
 
 /* Sensor parameters */
 #define SENSOR_W        1920
@@ -99,6 +102,10 @@
 #define GAIN_30FPS          8       /* 3.95x: the gain used before the frame rate drops */
 #define DIGITAL_MAX         2.0f
 #define FLICKER_HZ_DEFAULT  50      /* GC2607_ISP_FLICKER_HZ: 50, 60, or 0 = off */
+
+/* Lens shading (handover Q8): luminance strength, GC2607_ISP_LSC: 0..1, or off */
+#define LSC_STRENGTH_DEFAULT 0.7f
+#define LSC_SHIFT           12      /* gains in Q12: the table's largest, ~5.5, fits in 16 bits */
 
 /* Green-channel histogram for the highlight cap. */
 #define HISTOGRAM_BINS      64
@@ -342,6 +349,96 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
     out[3] = (uint8_t)(v  < 16 ? 16 : (v  > 240 ? 240 : v));
 }
 
+/*
+ * Lens-shading correction (handover Q8). The lens passes ~0.2 of the centre's light to the corners
+ * on every channel, and ~7% more red than green towards the edges (daylight flat fields,
+ * 2026-10-18). gc2607_lsc_table.h (tools/lsc_calibrate.py) holds the gains at LSC_NX x LSC_NY nodes
+ * spanning the frame corner to corner. Each raw row is corrected as it is read, before white
+ * balance: value = black + (raw - black) * gain, bilinear between the nodes. As in libcamera's ALSC,
+ * only the luminance part is scaled by the strength, 1 + strength * (luma - 1); the colour part is
+ * always applied in full. Values that come out above 1023 render white whatever the gains, so the
+ * clamp to 10 bits loses nothing on screen; a value clipped at the sensor (1023) stays clipped,
+ * so a colour gain below 1 cannot tint a blown highlight.
+ */
+enum lsc_colour { LSC_GREEN, LSC_RED, LSC_BLUE };
+
+static int lsc_on;
+/* Q12 gains along each node row, interpolated to every column: [row parity][node row][column]. */
+static uint16_t lsc_cols[2][LSC_NY][SENSOR_W];
+
+/* Gain at node (row j, column i) for one Bayer colour. */
+static float lsc_node(int j, int i, enum lsc_colour c, float strength)
+{
+    float g = 1.0f + strength * (lsc_luma[j][i] - 1.0f);
+    return c == LSC_RED ? g * lsc_red[j][i] : c == LSC_BLUE ? g * lsc_blue[j][i] : g;
+}
+
+/* Set the luminance strength (0..1) and build lsc_cols; a negative strength turns the correction off. */
+static void lsc_init(float strength)
+{
+    /* GRBG: even rows G R G R ..., odd rows B G B G ... */
+    static const enum lsc_colour site[2][2] = { { LSC_GREEN, LSC_RED }, { LSC_BLUE, LSC_GREEN } };
+
+    lsc_on = strength >= 0.0f;
+    if (!lsc_on)
+        return;
+    for (int p = 0; p < 2; p++)
+        for (int j = 0; j < LSC_NY; j++)
+            for (int x = 0; x < SENSOR_W; x++) {
+                float fx = (float)x * (LSC_NX - 1) / (SENSOR_W - 1);
+                int i = fx < LSC_NX - 1 ? (int)fx : LSC_NX - 2;
+                float t = fx - i;
+                enum lsc_colour c = site[p][x & 1];
+                float g = lsc_node(j, i, c, strength) * (1.0f - t) + lsc_node(j, i + 1, c, strength) * t;
+                lsc_cols[p][j][x] = (uint16_t)lroundf(g * (1 << LSC_SHIFT));
+            }
+}
+
+/* Luminance strength from GC2607_ISP_LSC (0..1, or "off" = -1); anything else gives the default. */
+static float lsc_strength_from_env(void)
+{
+    const char *v = getenv("GC2607_ISP_LSC");
+    if (!v)
+        return LSC_STRENGTH_DEFAULT;
+    if (strcmp(v, "off") == 0)
+        return -1.0f;
+    char *end;
+    float s = strtof(v, &end);
+    if (end == v || *end || !(s >= 0.0f && s <= 1.0f)) {   /* the negated test also rejects NaN */
+        printf("[gc2607_isp] GC2607_ISP_LSC=%s is not 0..1 or off, using %.2f\n", v, LSC_STRENGTH_DEFAULT);
+        return LSC_STRENGTH_DEFAULT;
+    }
+    return s;
+}
+
+/*
+ * Raw row y of the frame into dst (SENSOR_W values), lens-shading corrected and clamped to 10 bits.
+ * The restrict qualifiers let GCC vectorise both loops at -O2 (without them it would need a runtime
+ * alias check, which its -O2 cost model refuses): 13.5 -> 10.0 ms per frame on cpu 0 (make bench).
+ */
+static void lsc_row(uint16_t *restrict dst, const uint16_t *restrict src, int y)
+{
+    if (!lsc_on) {
+        for (int x = 0; x < SENSOR_W; x++)
+            dst[x] = src[x] < LUT_SIZE ? src[x] : LUT_SIZE - 1;
+        return;
+    }
+    int fy = y * (LSC_NY - 1) * 256 / (SENSOR_H - 1);   /* node row position, Q8 */
+    int j = fy >> 8, w = fy & 255;
+    if (j >= LSC_NY - 1) {
+        j = LSC_NY - 2;
+        w = 256;
+    }
+    const uint16_t *restrict a = lsc_cols[y & 1][j], *restrict b = lsc_cols[y & 1][j + 1];
+    for (int x = 0; x < SENSOR_W; x++) {
+        int s = src[x] < LUT_SIZE ? src[x] : LUT_SIZE - 1;
+        int g = (a[x] * (256 - w) + b[x] * w + 128) >> 8;
+        int v = BLACK_LEVEL + (((s - BLACK_LEVEL) * g + (1 << (LSC_SHIFT - 1))) >> LSC_SHIFT);
+        v = v < 0 ? 0 : (v > LUT_SIZE - 1 ? LUT_SIZE - 1 : v);
+        dst[x] = s == LUT_SIZE - 1 ? LUT_SIZE - 1 : v;
+    }
+}
+
 /* Per-frame statistics for white balance and exposure, filled by collect_stats(). */
 struct frame_stats {
     float r_mean, g_mean, b_mean;    /* raw above black, over samples neither saturated nor near black */
@@ -353,10 +450,12 @@ struct frame_stats {
 
 /*
  * Statistics from every WB_SUBSAMPLE-th 2x2 Bayer block in each direction (the half-resolution
- * sampling, whatever the output size). Needs this frame's LUTs for the display luma.
+ * sampling, whatever the output size), lens-shading corrected. Needs this frame's LUTs for the
+ * display luma.
  */
 static void collect_stats(const uint16_t *bayer, struct frame_stats *st)
 {
+    static uint16_t row0[SENSOR_W], row1[SENSOR_W];
     double r_sum = 0, g_sum = 0, b_sum = 0;
     uint64_t y_sum = 0;
     int stat_count = 0;
@@ -364,15 +463,12 @@ static void collect_stats(const uint16_t *bayer, struct frame_stats *st)
     memset(st->g_hist, 0, sizeof(st->g_hist));
 
     for (int oy = 0; oy < HALF_H; oy += WB_SUBSAMPLE) {
-        const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
-        const uint16_t *row1 = row0 + SENSOR_W;
+        lsc_row(row0, bayer + (oy * 2) * SENSOR_W, oy * 2);
+        lsc_row(row1, bayer + (oy * 2 + 1) * SENSOR_W, oy * 2 + 1);
 
         for (int ox = 0; ox < HALF_W; ox += WB_SUBSAMPLE) {
             int r = row0[ox * 2 + 1], b = row1[ox * 2];
             int g = (row0[ox * 2] + row1[ox * 2 + 1]) >> 1;
-            if (r >= LUT_SIZE) r = LUT_SIZE - 1;
-            if (g >= LUT_SIZE) g = LUT_SIZE - 1;
-            if (b >= LUT_SIZE) b = LUT_SIZE - 1;
 
             /* Histogram and display luma: every sampled pixel including saturated ones —
              * the highlight cap explicitly needs to see clipped values. */
@@ -410,13 +506,12 @@ static void collect_stats(const uint16_t *bayer, struct frame_stats *st)
 }
 
 /*
- * Copy one Bayer row into a line buffer with one extra column each side, clamped to 10 bits.
- * Column -1 reflects to column 1 and column W to W-2, which keep the Bayer colour.
+ * Copy Bayer row y into a line buffer with one extra column each side, lens-shading corrected and
+ * clamped to 10 bits. Column -1 reflects to column 1 and column W to W-2, which keep the Bayer colour.
  */
-static inline void load_padded_row(uint16_t *dst, const uint16_t *src)
+static inline void load_padded_row(uint16_t *dst, const uint16_t *bayer, int y)
 {
-    for (int c = 0; c < SENSOR_W; c++)
-        dst[c + 1] = src[c] < LUT_SIZE ? src[c] : LUT_SIZE - 1;
+    lsc_row(dst + 1, bayer + y * SENSOR_W, y);
     dst[0] = dst[2];
     dst[SENSOR_W + 1] = dst[SENSOR_W - 1];
 }
@@ -434,11 +529,11 @@ static void demosaic_full(const uint16_t *bayer)
 {
     static uint16_t lines[3][SENSOR_W + 2];
 
-    load_padded_row(lines[0], bayer);
-    load_padded_row(lines[1], bayer + SENSOR_W);
+    load_padded_row(lines[0], bayer, 0);
+    load_padded_row(lines[1], bayer, 1);
     for (int r = 0; r < SENSOR_H; r++) {
         if (r >= 1 && r + 1 < SENSOR_H)
-            load_padded_row(lines[(r + 1) % 3], bayer + (r + 1) * SENSOR_W);
+            load_padded_row(lines[(r + 1) % 3], bayer, r + 1);
         /* Row -1 reflects to row 1 and row H to row H-2 (same parity). */
         const uint16_t *U = lines[(r == 0 ? 1 : r - 1) % 3] + 1;
         const uint16_t *C = lines[r % 3] + 1;
@@ -479,10 +574,12 @@ static void demosaic_full(const uint16_t *bayer)
  */
 static void bin_half(const uint16_t *bayer)
 {
+    static uint16_t row0[SENSOR_W], row1[SENSOR_W];
+
     for (int oy = 0; oy < HALF_H; oy++) {
-        /* Bayer row pointers for this 2x2 block row */
-        const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
-        const uint16_t *row1 = bayer + (oy * 2 + 1) * SENSOR_W;
+        /* The two Bayer rows of this 2x2 block row, corrected and clamped to 10 bits */
+        lsc_row(row0, bayer + (oy * 2) * SENSOR_W, oy * 2);
+        lsc_row(row1, bayer + (oy * 2 + 1) * SENSOR_W, oy * 2 + 1);
 
         /* Output row (flipped) */
         int out_y = HALF_H - 1 - oy;
@@ -505,17 +602,9 @@ static void bin_half(const uint16_t *bayer)
             uint16_t b_1  = row1[bx1];
             uint16_t g2_1 = row1[bx1 + 1];
 
-            /* Clamp to 10-bit range */
-            if (r_0  >= LUT_SIZE) r_0  = LUT_SIZE - 1;
-            if (b_0  >= LUT_SIZE) b_0  = LUT_SIZE - 1;
-            if (r_1  >= LUT_SIZE) r_1  = LUT_SIZE - 1;
-            if (b_1  >= LUT_SIZE) b_1  = LUT_SIZE - 1;
-
             /* Green average via LUT: average the two raw greens, then LUT */
             uint16_t gavg_0 = (g1_0 + g2_0) >> 1;
             uint16_t gavg_1 = (g1_1 + g2_1) >> 1;
-            if (gavg_0 >= LUT_SIZE) gavg_0 = LUT_SIZE - 1;
-            if (gavg_1 >= LUT_SIZE) gavg_1 = LUT_SIZE - 1;
 
             /* Apply LUTs */
             uint8_t R0 = lut_r[r_0],  G0 = lut_g[gavg_0], B0 = lut_b[b_0];
@@ -1102,8 +1191,13 @@ int main(int argc, char *argv[])
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     select_output_size();
-    printf("[gc2607_isp] Starting with lazy activation (capture=%s output=%s %dx%d)\n",
-           capture_dev, output_dev, out_w, out_h);
+    float lsc_strength = lsc_strength_from_env();
+    lsc_init(lsc_strength);
+    char lsc_desc[16] = "off";
+    if (lsc_on)
+        snprintf(lsc_desc, sizeof(lsc_desc), "%.2f", lsc_strength);
+    printf("[gc2607_isp] Starting with lazy activation (capture=%s output=%s %dx%d, lens shading %s)\n",
+           capture_dev, output_dev, out_w, out_h, lsc_desc);
 
     /* sigaction without SA_RESTART: glibc's signal() restarts interrupted calls,
      * which is how a SIGTERM used to wait out the whole stop timeout. */

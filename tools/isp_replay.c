@@ -5,7 +5,8 @@
  *
  * Writes OUT_PREFIX.yuyv (the exact bytes the ISP would send to /dev/video50) and OUT_PREFIX.json
  * (size and the controls used). FRAME defaults to the last frame in the file. The output size follows
- * GC2607_ISP_HALF_RES as in the service (1 = 960x540 binned, otherwise 1920x1080).
+ * GC2607_ISP_HALF_RES as in the service (1 = 960x540 binned, otherwise 1920x1080), and so does the
+ * lens-shading strength, GC2607_ISP_LSC.
  *
  * White balance is the frame's own grey-world gains. Exposure: the sensor controls are fixed in a
  * capture, so the controller's metering (ae_meter_frame) is iterated on a virtual digital gain, without
@@ -43,6 +44,7 @@ int main(int argc, char **argv)
     }
     fclose(f);
     select_output_size();
+    lsc_init(lsc_strength_from_env());
 
     /* Statistics are taken from raw values, so the gains used for this first pass do not matter
      * for white balance. */

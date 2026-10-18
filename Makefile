@@ -13,7 +13,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # Userspace ISP program
-ISP_SRC := gc2607_isp.c
+ISP_SRC := gc2607_isp.c gc2607_lsc_table.h   # the source first: rules compile $<
 ISP_BIN := gc2607_isp
 CC_USER ?= gcc
 CFLAGS_USER ?= -O2 -Wall -Wextra -march=native

@@ -17,16 +17,19 @@ int main(void)
     double t[ITER], a;
 
     fill_bayer(bayer, SENSOR_W * SENSOR_H);
-    for (half_res = 0; half_res <= 1; half_res++) {
-        for (int k = 0; k < 20; k++)
-            process_frame(bayer, wb, 1.3f, &st);
-        for (int k = 0; k < ITER; k++) {
-            a = now_ms();
-            process_frame(bayer, wb, 1.3f, &st);
-            t[k] = now_ms() - a;
+    for (half_res = 0; half_res <= 1; half_res++)
+        for (int lsc = 0; lsc <= 1; lsc++) {
+            lsc_init(lsc ? LSC_STRENGTH_DEFAULT : -1.0f);
+            for (int k = 0; k < 20; k++)
+                process_frame(bayer, wb, 1.3f, &st);
+            for (int k = 0; k < ITER; k++) {
+                a = now_ms();
+                process_frame(bayer, wb, 1.3f, &st);
+                t[k] = now_ms() - a;
+            }
+            printf("process_frame (%s, lens shading %s): %.2f ms\n", half_res ? "960x540 binned" : "1920x1080 demosaic",
+                   lsc ? "on" : "off", median_ms(t));
         }
-        printf("process_frame (%s): %.2f ms\n", half_res ? "960x540 binned" : "1920x1080 demosaic", median_ms(t));
-    }
 
     for (int k = 0; k < ITER; k++) {
         a = now_ms();
