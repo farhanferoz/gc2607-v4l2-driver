@@ -138,3 +138,23 @@ statistics moved into `collect_stats()`, with the same half-resolution sampling 
   median used to average away. A side-by-side crop of normal_e600_g4 shows a visibly sharper face with faint colour
   speckle on skin. Those frames were taken at 2x gain; Q1 should bring room-light gain to 1x, so re-measure after Q1
   before adding a chroma filter.
+
+## Owner review of the display curve (2026-10-18)
+
+The owner sent a photo from the installed (pre-fix) pipeline: soft, grainy, washed out. Its status lines: 960x540,
+exposure 900 lines, gain index 4 (2x) in daylight, software brightness 1.55 set by the highlight cap. Raw captures of
+the same room (`room-day_e900_g4`, `_e1800_g0`, `_e1002_g4` in the corpus): wall temporal SNR 38.4 at 900/4, 50.6 at
+1800/0 (same light, ~30% less noise at 1x gain but needs ~56 ms, i.e. 15 fps). Four curves rendered from
+`room-day_e900_g4` and `normal_e600_g4`, all metered to display mean 0.45 (`/home/ff235/cache/gc2607/tone-variants-
+room.png`, `-evening.png`): A installed curve, B Q2 as specified, C B with contrast 0.6 and a 1.5% black point, D C
+with 1.6x colour. **The owner chose B**, so Q2 stays as specified. Frame-rate policy left at the handover's default
+(30 fps first, gain before a longer frame).
+
+## Metric fix: highlight neutrality on raw-saturated pixels (2026-10-18)
+
+`tools/isp_metrics.py` scored `hl_neutral` over pixels that are bright on screen (Y >= 0.98); the handover defines it
+over pixels whose raw channels are all >= 1008, which must render white. Brighter rendering (Q2, Q1) puts unsaturated,
+genuinely coloured surfaces above Y 0.98, so the old definition read as a regression that was not one. Now: 2x2 Bayer
+blocks saturated at all four sites, rotated as the ISP rotates. `tools/baseline_metrics.json` is re-scored with the
+pre-fix ISP (sources from 6a3a198) and now also holds the three `room-day` captures: every other field is identical
+to the previous file (checked field by field); `hl_neutral` is 0.0 wherever a capture has saturated blocks.

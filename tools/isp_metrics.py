@@ -6,7 +6,8 @@
 For every <name>.raw from gc2607-raw-capture.sh in CORPUS_DIR, runs build/isp_replay on its last frame,
 writes OUT_DIR/<name>.yuyv, .json and a viewable .ppm, and prints one JSON object of metrics per file.
 Output metrics (display values 0..1): y_mean, dark_quarter (mean of the darkest 25% of 16x16 zones),
-clipped (fraction with Y >= 0.98), hl_neutral (mean |R-G| and |B-G| over clipped pixels, 0-255),
+clipped (fraction with Y >= 0.98), hl_neutral (mean |R-G| and |B-G| over pixels whose raw 2x2 block is
+saturated at all four sites, 0-255: they should render white),
 false_colour (mean chroma magnitude in the centre half, 0-128) and noise (std of Y in the centre 20%).
 Raw metrics, independent of the ISP: corner/centre ratio per Bayer channel, row banding (std of
 detrended green row means / mean), and per-channel black level for 'dark' scenes.
@@ -22,6 +23,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 REPLAY = REPO / "build" / "isp_replay"
 W, H = 1920, 1080
 CLIP_Y = 0.98
+RAW_SATURATED = 1008  # the top raw histogram bin
 ZONES = 16
 
 
@@ -44,13 +46,21 @@ def centre(a: np.ndarray, frac: float) -> np.ndarray:
     return a[dh:h - dh, dw:w - dw]
 
 
-def output_metrics(yuyv: np.ndarray, width: int, height: int) -> dict:
+def raw_saturated(raw: np.ndarray, width: int) -> np.ndarray:
+    """Output-pixel mask of Bayer 2x2 blocks saturated at all four sites, rotated 180 degrees as the ISP does."""
+    sat = np.logical_and.reduce([raw[i::2, j::2] >= RAW_SATURATED for i in (0, 1) for j in (0, 1)])
+    if width == W:
+        sat = sat.repeat(2, axis=0).repeat(2, axis=1)
+    return sat[::-1, ::-1]
+
+
+def output_metrics(yuyv: np.ndarray, width: int, height: int, saturated: np.ndarray) -> dict:
     """Score one ISP output frame."""
     y, rgb, chroma = yuyv_to_rgb(yuyv, width, height)
     zh, zw = height // ZONES, width // ZONES
     zones = np.sort(y[:zh * ZONES, :zw * ZONES].reshape(ZONES, zh, ZONES, zw).mean(axis=(1, 3)).ravel())
     clipped = y >= CLIP_Y
-    hl = rgb[clipped]
+    hl = rgb[saturated]
     return {
         "y_mean": round(float(y.mean()), 4),
         "dark_quarter": round(float(zones[: len(zones) // 4].mean()), 4),
@@ -105,7 +115,7 @@ def main() -> None:
         frames = raw_path.stat().st_size // (W * H * 2)
         raw = np.fromfile(raw_path, np.uint16, count=W * H, offset=(frames - 1) * W * H * 2).reshape(H, W)
         write_ppm(prefix.with_suffix(".ppm"), yuyv_to_rgb(yuyv, width, height)[1])
-        results[raw_path.stem] = {"controls": info, **output_metrics(yuyv, width, height), "raw": raw_metrics(raw)}
+        results[raw_path.stem] = {"controls": info, **output_metrics(yuyv, width, height, raw_saturated(raw, width)), "raw": raw_metrics(raw)}
     json.dump(results, sys.stdout, indent=1)
     print()
 
