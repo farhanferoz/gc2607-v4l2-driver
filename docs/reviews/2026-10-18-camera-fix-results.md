@@ -448,3 +448,35 @@ only the luminance part is scaled, the colour part is always whole. `GC2607_ISP_
   status lines the cap already bound in 25 of 69 (P98 >= 0.89 or >= 2% clipped). Not changed here: weighting the
   metering towards the centre (or relaxing the cap) is a separate exposure decision. `GC2607_ISP_LSC=off` restores
   the old rendering.
+
+## Chroma filter for the full-resolution output (2026-10-18 evening)
+
+Trigger: the owner's 18:01 frame (exposure 2004, gain index 16, d 2.00, 16.5 fps, Y 0.40: every limit reached in a
+room giving ~1/10 of the 16:52 light) showed coloured speckle. Q3b had measured that cost and parked it ("re-measure
+after Q1 before adding a chroma filter"); the re-measure had not been done. Temporal noise (std of frames 4 - 3 over
+sqrt 2, centre half, 0-255), full resolution vs the binned path: chroma 8.63 vs 3.62 (dim_e2000_g8) and 4.31 vs 1.87
+(normal_e600_g4), luma 5.33 vs 5.75 and 3.63 vs 3.83. So 2.3-2.6x the colour noise in room light too, not only in
+the dark; brightness grain is the sensor's and the same either way.
+
+- Change: `chroma_box_row()`, the mean of U and V over 3 pairs x 5 rows (6 x 5 pixels), Y untouched, run inside the
+  demosaic loop two rows behind the writer. Size from a prototype on the replays: 3x3 pairs x rows 4.76 / 2.37,
+  3x5 3.92 / 1.96, 5x5 3.16 / 1.59 (dim / normal); 3x5 is the smallest that matches the binned path. The binned
+  path's 3x3 median would cost ~24 ms at this size.
+- Cost (`make bench`, lens shading on): cpu 0 10.0 -> 11.4 ms, cpu 12 21.2 -> 24.2 ms. Two slower versions first:
+  a separate pass reading U and V out of the interleaved bytes (+3.5 / +5.6 ms; filter alone 2.8 / 6.2 ms) and the
+  same inside the demosaic loop (no gain: the cost was arithmetic, not memory). The kept version works on the
+  16-bit words (U and V are the high bytes of alternate words), so every loop is contiguous and vectorises, and
+  divides by 15 as `(s + 7) * 4370 >> 16` (exact for every sum up to 15 x 255, checked exhaustively). Its output
+  is byte-identical to the first version on all six replayed frames.
+- Live, dark room (exposure 2004, gain 16, 16.5-17 fps), ISP CPU over 10 s of streaming: 39% of a core before,
+  35% after: no measurable change at this frame rate (run-to-run variation is larger than the cost).
+- `GC2607_ISP_HALF_RES=1`: byte-identical to before on all six frames.
+- Corpus (31 captures, HEAD vs this): y_mean, clipped and luma noise identical everywhere; `false_colour` (mean
+  chroma magnitude, centre half, includes real colour) halves on flat and dark captures (flat_e600_g4 6.95 ->
+  3.48, dark2_e600_g4 73.1 -> 32.6) and falls 9-10% on coloured real scenes (room-day_e900_g4 5.87 -> 5.30,
+  texture_e600_g4 5.05 -> 4.60), so real colour stays.
+- Tests (`tests/test_output.c`): an impulse of U +30 must become +2 over exactly 3 pairs x 5 rows with Y and V
+  untouched; the step edge may now colour one pair further each side and must do so (proves the filter runs on
+  the output). Mutations: filter call removed -> the step check fails; the outer two rows dropped -> the impulse
+  check fails (3 of 15).
+- Installed 18:30 (sha256 7b1e2274...e388 in /opt and the build); `make test` ok.
