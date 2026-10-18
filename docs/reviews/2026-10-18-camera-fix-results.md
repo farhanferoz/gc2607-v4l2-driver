@@ -382,3 +382,69 @@ Green over a 5x5 grid, relative to the centre cell, at 1100 lines index 2:
 The lamp capture gave the same ring within a few hundredths, so the falloff belongs to the lens, not the light. It is
 mostly luminance (the channels within ~0.03 of each other); the bottom row is ~0.05 brighter than the top, likely the
 window's own gradient. Every channel is far below the handover's 0.8 trigger: Q8's correction is warranted.
+
+## Q8 correction: lens shading (2026-10-18 evening)
+
+**Table.** `tools/lsc_calibrate.py` fits each `dayflat_*` capture (frames averaged, 10x10-pixel blocks of each Bayer
+plane) in the log domain with a polynomial in even powers of the offset from the frame centre on each axis, so the
+fit is symmetric left-right and top-bottom, and writes `gc2607_lsc_table.h`: luminance gain (centre green / green)
+and red and blue colour gains at 32 x 18 nodes spanning the frame corner to corner.
+- Symmetry is measured, not assumed: the falloff's peak sits within ~1 block (2% of the width) of the centre in all
+  eight flat fields, and what the symmetric fit leaves over (rms 1.9-5.5%) follows the light, not the lens: the four
+  daylight captures correlate with one another at +0.73..+0.91, the two lamp captures with them at -0.54..+0.26 and
+  with each other at -0.79.
+- Fit: luminance to the 8th power (u^2i v^2j, i+j <= 4; symmetric residual max 1.4-2.6%), colour ratios to the 4th
+  (0.8-2.3%). The four captures' own tables agree with their mean within 2.0-4.7% (luminance) and 0.2-1.4% (colour).
+- Colour shading is real: red/green rises to 1.057-1.069 of the centre at the corners in all four daylight captures
+  (lamp 1.045); blue/green moves 1-2%. Hence per-channel gains (corner: luminance 5.51, red 0.936, blue 1.009).
+- Grid: bilinear interpolation against the fitted surface, max/mean error 3.8/1.25% at 16 x 9 (the handover's
+  example), 1.9/0.50% at 24 x 14, **1.2/0.29% at 32 x 18**, 0.8/0.18% at 40 x 23. 32 x 18 sits below the fit's own
+  uncertainty.
+
+**ISP.** `lsc_row()` corrects each raw row as it is read, for all three readers (`collect_stats`, `load_padded_row`
+for the 1080p demosaic, `bin_half`): `64 + (raw - 64) * gain`, Q12 gains, clamped to 10 bits; a value clipped at the
+sensor (1023, where the corpus's highlights pile up) stays clipped. Strength follows libcamera's ALSC
+(`src/ipa/rpi/controller/rpi/alsc.cpp`, `addLuminanceRb`/`addLuminanceG`: `lambda * ((lut - 1) * strength + 1)`):
+only the luminance part is scaled, the colour part is always whole. `GC2607_ISP_LSC` = 0..1 or `off`; **default
+0.7** (libcamera's tuning example uses 0.7, its run-time default is 1.0). The start-up log line names the strength.
+
+**Validation.**
+- `--verify` (raw corner/centre per channel, `raw_metrics`), full strength: dayflat 0.964-1.070 on every channel
+  (before 0.206-0.241); lamp `flatfield_e1000` (not used in the fit) 0.964-1.054 (before 0.210-0.224). The dimmest
+  lamp capture, `flatfield_e360` (6.8 counts mean, ~2 counts above black in the corners, where the black level is
+  known to ~0.3 counts), gives 0.86-0.98: below the noise floor, not counted.
+- `GC2607_ISP_LSC=off` reproduces the shipped ISP (13e8bca) byte for byte on all 18 corpus frames at both output
+  sizes (36 replays).
+- `tests/test_lsc.c`: a frame shaded exactly as the table says comes out flat (within 4 counts, the rounding of the
+  shaded input times the gain) through `lsc_row`, through the statistics (green mean within 2%) and at the corners of
+  both output sizes (within 2 levels; without correction > 40, so the check can see shading); half strength scales
+  only the luminance part; a clipped red stays clipped where its colour gain is below 1; `GC2607_ISP_LSC` parsing.
+  Each guard was broken once and went red (9 mutations: no gain, no vertical interpolation, statistics or binned path
+  uncorrected, no clip guard, strength applied to colour too, two parser relaxations, colour sites swapped).
+- `make bench` (laptop, median of 200, correction at 0.7): 1080p **10.04 ms on cpu 0** (bar 13; off 9.18),
+  **21.20 ms on cpu 12** (bar 22; off 18.72), 37.03 ms on cpu 20 (off 32.04; the unit's `CPUAffinity=0-19` keeps the
+  service off cpus 20-21). The first version cost 13.49 / 28.66 ms: GCC refused to vectorise the row loops at -O2
+  ("would need a runtime alias check", `-fopt-info-vec-missed`); `restrict` on the row pointers vectorises both
+  (32-byte vectors) and also sped up the off path (10.54 -> 9.18 ms on cpu 0). Output unchanged (off: the 36
+  byte-identical replays; 0.7: identical to the pre-`restrict` renders).
+- `make test` on the laptop: test_ae, test_lut, test_output, test_lsc ok.
+- Corpus replays at strength off / 0.5 / 0.7 / 1 (display luma, corners = outer tenth of each side, temporal noise =
+  std of the difference of frames 3 and 4 over sqrt 2, 0-255):
+
+| Capture | corner/centre Y | corner noise | frame mean Y |
+|---|---|---|---|
+| room-day_e1002_g4 | 0.52 / 0.82 / 0.91 / 1.03 | 1.60 / 2.01 / 2.09 / 2.11 | 116 / 116 / 116 / 114 |
+| dim_e2000_g8 | 0.67 / 1.08 / 1.21 / 1.38 | 7.22 / 9.17 / 9.69 / 10.04 | 117 / 116 / 117 / 116 |
+| backlit2_e600_g4 | 0.68 / 1.07 / 1.19 / 1.34 | 8.30 / 10.70 / 11.08 / 11.53 | 116 / 118 / 117 / 116 |
+| normal_e600_g4 (evening) | 1.80 / 2.95 / 3.33 / 3.88 | 3.93 / 4.13 / 4.20 / 4.19 | **115 / 97 / 95 / 90** |
+
+  Corner noise rises ~25-40% with any correction and only ~4% between 0.7 and 1. Viewed at 1:1 (dim and backlit
+  corners): visible but modest at 0.7.
+- **Known cost: evening scenes with bright edges render darker.** In `normal_e600_g4` the ceiling lights and the
+  walls by the top corners, which the lens had dimmed, now reach the highlight cap (replay: P98 = 0.920, the cap),
+  so exposure comes down and the frame mean falls from 0.445 to 0.368 at 0.7 (the face visibly darker); the other
+  scenes keep their brightness. The cap is this ISP's own design (Q1: P98 <= 0.92 always); libcamera's default
+  "normal" constraint mode has no upper bound on highlights (only "highlight" mode does; imx219.json). In today's
+  status lines the cap already bound in 25 of 69 (P98 >= 0.89 or >= 2% clipped). Not changed here: weighting the
+  metering towards the centre (or relaxing the cap) is a separate exposure decision. `GC2607_ISP_LSC=off` restores
+  the old rendering.
