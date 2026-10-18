@@ -321,3 +321,27 @@ Left for the owner: the two May copies of the service script in /opt/gc2607 (`gc
 `gc2607-finalize.sh`, a June 7.0.12 migration script that pointed at `ipu-bridge-oot/` (a power script, outside this
 work); and ~39 early experiment files in the repo root (`test_*.sh`, `view_raw*.py`, `QUICK_TEST.sh`,
 `start_camera_service.sh`, `reload_for_chrome.sh`, ...), outside the handover's list.
+
+## Q9 White balance robustness (2026-10-18)
+
+Grey-world gains relative to green are held to red 1.27-2.94 and blue 1.24-2.62: the range in 60 days of logs (red
+1.53-2.45, blue 1.49-2.18 over 4,520 status lines, re-measured from the journal) widened by 20% each way. The statistics
+skip samples whose brightest channel is within 4 counts of black, and a frame with under 1% usable samples keeps the
+previous balance.
+
+The near-black threshold was measured, not taken from the handover: replaying the corpus with 0, 4, 8 and 16 counts,
+the low-signal neutral captures (`flat_*`, `wall_e644`, ~9-12 counts of signal) came out no more neutral at any
+threshold and less neutral at 16 (centre chroma flat_e450 9.25 -> 9.79, wall_e644 9.39 -> 10.22); 4 changed them by
+at most 0.04. The black level is accurate (T0.2-T0.4), so the exclusion only guards against a future offset.
+
+`make test`: 3 ok. New checks in `tests/test_lut.c`: half the frame 3/1/1 counts above black leaves the balance at the
+grey card's (R/G 2.000, B/G 1.765, within 0.01); a blue wall over 85% of the frame keeps the gains inside the limits
+and the grey card's worst channel error under 45% (42.5%; unlimited grey world: R/G 2.85, B/G 0.63, 64%, the
+handover's "less cast in a grey ROI than the baseline"). Mutations, each caught: the old 0.25-4 bounds fail both
+blue-wall checks; dropping the near-black test moves the balance to R/G 1.967.
+
+Corpus (`isp_replay` against C1, `/home/ff235/cache/gc2607/replay/{c1,q9}_metrics.json`): every neutral capture within
+0.04 of centre chroma. The colour-dominated captures are now held: the finger over the lens (red light, dark_e2000_g16)
+kept red gain 1.27 where grey world asked 0.70, so it renders red instead of grey (chroma 31.9 -> 43.4), and the opaque
+cover's noise no longer sets the gains. The corpus has no grey patch inside a one-colour scene, so the cast reduction
+itself is shown by the unit test only. Live after `gc2607-install-isp.sh`: WB R 2.16, B 1.90, Y 0.456, 29.2 fps.

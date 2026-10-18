@@ -49,6 +49,17 @@
 /* Auto white balance */
 #define WB_SMOOTHING    0.85f   /* Temporal smoothing (higher = more stable) */
 #define WB_SUBSAMPLE    8       /* Sample every Nth pixel for WB stats */
+/* WB skips samples whose brightest channel is within this of black. 4, not more: on the corpus's
+ * low-signal neutral captures 16 left them less neutral (centre chroma 9.25 -> 9.79, 9.39 -> 10.22) and
+ * 4 changed nothing (+/-0.04); the black level itself is accurate (64.0-64.3 measured). */
+#define WB_MIN_SIGNAL   4
+/* Grey-world gains relative to green are held to the range logged in 60 days of use (red 1.53-2.45,
+ * blue 1.49-2.18, 4,520 status lines to 2026-10-18) widened by 20% each way, so a scene filled by
+ * one colour cannot pull the balance far from any real light (handover Q9). */
+#define WB_R_MIN        1.27f
+#define WB_R_MAX        2.94f
+#define WB_B_MIN        1.24f
+#define WB_B_MAX        2.62f
 
 /*
  * Exposure control (camera-fix handover Q1): one controller owns the total exposure
@@ -333,7 +344,7 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
 
 /* Per-frame statistics for white balance and exposure, filled by collect_stats(). */
 struct frame_stats {
-    float r_mean, g_mean, b_mean;    /* raw above black, over unsaturated samples */
+    float r_mean, g_mean, b_mean;    /* raw above black, over samples neither saturated nor near black */
     int count;                        /* samples in those means */
     float y_mean;                     /* display luma of every sample after the LUTs, 0..1 */
     uint32_t g_hist[HISTOGRAM_BINS];  /* raw green of every sample, saturated included */
@@ -371,8 +382,10 @@ static void collect_stats(const uint16_t *bayer, struct frame_stats *st)
 
             /* WB / mean stats: skip saturated — clipped values hide the
              * true channel ratio, causing AWB to underestimate green
-             * dominance in bright scenes. */
-            if (r < 1020 && g < 1020 && b < 1020) {
+             * dominance in bright scenes — and near-black, where noise and
+             * any black-level error outweigh the colour. */
+            int peak = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            if (r < 1020 && g < 1020 && b < 1020 && peak >= BLACK_LEVEL + WB_MIN_SIGNAL) {
                 float rv = fmaxf((float)r - BLACK_LEVEL, 0.0f);
                 float gv = fmaxf((float)g - BLACK_LEVEL, 0.0f);
                 float bv = fmaxf((float)b - BLACK_LEVEL, 0.0f);
@@ -547,14 +560,14 @@ static void wb_gains(float r_rel, float b_rel, float wb[3])
     wb[2] = b_rel / lo;
 }
 
-/* Grey-world gains relative to green from one frame, each within 0.25..4. Returns 0 when a
- * channel is too dark to measure. */
+/* Grey-world gains relative to green from one frame, within WB_R_* and WB_B_*. Returns 0 (keep the
+ * previous balance) when under 1% of the samples are usable or a channel is too dark to measure. */
 static int wb_from_stats(const struct frame_stats *st, float *r_rel, float *b_rel)
 {
-    if (st->r_mean <= 1.0f || st->g_mean <= 1.0f || st->b_mean <= 1.0f)
+    if (st->count * 100 < st->hist_total || st->r_mean <= 1.0f || st->g_mean <= 1.0f || st->b_mean <= 1.0f)
         return 0;
-    *r_rel = fminf(fmaxf(st->g_mean / st->r_mean, 0.25f), 4.0f);
-    *b_rel = fminf(fmaxf(st->g_mean / st->b_mean, 0.25f), 4.0f);
+    *r_rel = fminf(fmaxf(st->g_mean / st->r_mean, WB_R_MIN), WB_R_MAX);
+    *b_rel = fminf(fmaxf(st->g_mean / st->b_mean, WB_B_MIN), WB_B_MAX);
     return 1;
 }
 
