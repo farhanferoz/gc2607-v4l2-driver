@@ -26,7 +26,8 @@
 #define NBUF 4
 #define FRAMES 40
 #define WRITE_AFTER 20
-#define CHANGED 0.30 /* a 2x step moves the mean far more than this */
+#define CHANGED 0.30 /* a 2x step moves the signal far more than this */
+#define BLACK_LEVEL 64 /* compare signal above black: in a dark room the black level dominates the raw mean */
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -128,7 +129,7 @@ int main(int argc, char **argv)
 
     int first = -1;
     for (int f = WRITE_AFTER - 5; f < FRAMES; f++) {
-        double rel = mean[f] / mean[WRITE_AFTER] - 1.0;
+        double rel = (mean[f] - BLACK_LEVEL) / (mean[WRITE_AFTER] - BLACK_LEVEL) - 1.0;
         printf("frame %2d seq %4u mean %7.1f (%+5.0f%%)%s\n", f, seq[f], mean[f], 100 * rel,
                f == WRITE_AFTER ? "  <- step written after this frame" : "");
         if (f > WRITE_AFTER && first < 0 && fabs(rel) > CHANGED)

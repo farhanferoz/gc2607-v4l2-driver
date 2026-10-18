@@ -46,6 +46,10 @@ $(BUILD)/bench_isp: tools/bench_isp.c tools/bench_common.h $(ISP_SRC) | $(BUILD)
 $(BUILD)/ae_latency: tools/ae_latency.c | $(BUILD)
 	$(CC_USER) $(CFLAGS_USER) -o $@ $< -lm
 
+# Offline replay of one raw frame through the ISP, used by tools/isp_metrics.py.
+$(BUILD)/isp_replay: tools/isp_replay.c $(ISP_SRC) | $(BUILD)
+	$(CC_USER) $(CFLAGS_USER) -Wno-unused-function -o $@ tools/isp_replay.c -lm
+
 bench: $(BUILD)/bench_isp
 	@for c in 0 12 20; do echo "== cpu $$c"; taskset -c $$c ./$(BUILD)/bench_isp; done
 
