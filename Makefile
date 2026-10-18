@@ -42,6 +42,10 @@ $(BUILD):
 $(BUILD)/bench_isp: tools/bench_isp.c tools/bench_common.h $(ISP_SRC) | $(BUILD)
 	$(CC_USER) $(CFLAGS_USER) -Wno-unused-function -o $@ tools/bench_isp.c -lm
 
+# Frames-until-a-control-change-applies probe, run by gc2607-raw-capture.sh --latency.
+$(BUILD)/ae_latency: tools/ae_latency.c | $(BUILD)
+	$(CC_USER) $(CFLAGS_USER) -o $@ $< -lm
+
 bench: $(BUILD)/bench_isp
 	@for c in 0 12 20; do echo "== cpu $$c"; taskset -c $$c ./$(BUILD)/bench_isp; done
 
