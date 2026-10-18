@@ -107,25 +107,6 @@ chown -R "${USER}:${USER}" "${USER_HOME}/.config/wireplumber"
 # Install systemd service
 echo "Installing systemd service..."
 install -m 0644 "${SCRIPT_DIR}/gc2607-camera.service" /etc/systemd/system/gc2607-camera.service
-[Unit]
-Description=GC2607 Camera Virtual Webcam
-After=multi-user.target graphical.target
-Wants=multi-user.target
-Conflicts=sleep.target
-
-[Service]
-Type=simple
-ExecStart=${INSTALL_DIR}/gc2607-service.sh
-ExecStartPost=${INSTALL_DIR}/gc2607-restart-wireplumber.sh
-Restart=on-abnormal
-RestartSec=5
-TimeoutStopSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
 
 systemctl daemon-reload
 systemctl enable gc2607-camera.service
