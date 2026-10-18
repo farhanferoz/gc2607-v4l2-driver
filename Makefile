@@ -54,7 +54,7 @@ bench: $(BUILD)/bench_isp
 	@for c in 0 12 20; do echo "== cpu $$c"; taskset -c $$c ./$(BUILD)/bench_isp; done
 
 # Unit tests include gc2607_isp.c directly, so they can reach its static functions.
-$(BUILD)/test_%: tests/test_%.c $(ISP_SRC) | $(BUILD)
+$(BUILD)/test_%: tests/test_%.c tests/check.h $(ISP_SRC) | $(BUILD)
 	$(CC_USER) $(CFLAGS_USER) -Wno-unused-function -o $@ $< -lm
 
 test: $(TEST_BINS)

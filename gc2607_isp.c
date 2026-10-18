@@ -6,7 +6,7 @@
  *   - Black level subtraction
  *   - Gray-world auto white balance
  *   - Auto-exposure (software + hardware)
- *   - S-curve contrast + sRGB gamma via per-channel LUT
+ *   - sRGB encoding + mild contrast via per-channel LUT
  *   - 180° rotation
  * Outputs YUYV to v4l2loopback.
  *
@@ -48,6 +48,7 @@
 /* ISP parameters */
 #define BLACK_LEVEL     64    /* Sensor hardware black level */
 #define MAX_SIGNAL      959.0f  /* 1023 - 64 = usable range */
+#define LUT_CONTRAST    0.25f /* share of a smoothstep mixed into the display curve */
 
 /* Auto white balance */
 #define WB_SMOOTHING    0.85f   /* Temporal smoothing (higher = more stable) */
@@ -175,55 +176,35 @@ static int xioctl(int fd, unsigned long request, void *arg)
     return r;
 }
 
-/*
- * The earlier ACES + asymmetric tone shape stack is removed: with LTM
- * doing the dynamic-range compression in display space, the global LUT
- * just needs to do exposure scaling, mild midtone contrast, and sRGB
- * gamma encoding. The smoothstep gives a small S-curve in midtones; LTM
- * handles the bright regions per-pixel based on local luminance, which
- * a global curve cannot do regardless of how it's shaped.
- */
+/* sRGB encoding (IEC 61966-2-1) of a linear value in [0, 1]. */
+static inline float srgb_encode(float v)
+{
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+}
 
 /*
  * Build per-channel LUTs that encode the per-pixel pipeline:
- *   black_level_subtract -> WB_gain -> exposure -> smoothstep -> sRGB gamma
+ *   black_level_subtract -> WB_gain -> brightness -> sRGB encoding -> mild contrast
  *
- * Smoothstep gives mild midtone contrast (was the original behaviour
- * before the ACES experiments). Highlight handling is now LTM's job, so
- * this LUT can stay simple: clamp to [0,1], smoothstep, gamma.
+ * The contrast mixes LUT_CONTRAST of a smoothstep into the ENCODED value. Until 2026-10-18
+ * the smoothstep ran on linear values before a 1/2.2 gamma, which rendered 18% grey at
+ * 83/255 instead of ~117 and crushed the shadows (handover Q2).
  *
  * Called once per frame with updated WB gains and brightness.
  */
 static void build_luts(float r_gain, float g_gain, float b_gain, float brightness)
 {
-    float scale_r = r_gain * brightness / MAX_SIGNAL;
-    float scale_g = g_gain * brightness / MAX_SIGNAL;
-    float scale_b = b_gain * brightness / MAX_SIGNAL;
+    const float gains[3] = { r_gain, g_gain, b_gain };
+    uint8_t *luts[3] = { lut_r, lut_g, lut_b };
 
-    for (int i = 0; i < LUT_SIZE; i++) {
-        float raw = (float)(i - BLACK_LEVEL);
-        if (raw < 0.0f) raw = 0.0f;
-
-        /* R channel */
-        float vr = raw * scale_r;
-        if (vr > 1.0f) vr = 1.0f;
-        vr = vr * vr * (3.0f - 2.0f * vr);       /* smoothstep midtone contrast */
-        vr = powf(vr, 1.0f / 2.2f);              /* sRGB gamma */
-        lut_r[i] = (uint8_t)(vr * 255.0f + 0.5f);
-
-        /* G channel */
-        float vg = raw * scale_g;
-        if (vg > 1.0f) vg = 1.0f;
-        vg = vg * vg * (3.0f - 2.0f * vg);
-        vg = powf(vg, 1.0f / 2.2f);
-        lut_g[i] = (uint8_t)(vg * 255.0f + 0.5f);
-
-        /* B channel */
-        float vb = raw * scale_b;
-        if (vb > 1.0f) vb = 1.0f;
-        vb = vb * vb * (3.0f - 2.0f * vb);
-        vb = powf(vb, 1.0f / 2.2f);
-        lut_b[i] = (uint8_t)(vb * 255.0f + 0.5f);
+    for (int c = 0; c < 3; c++) {
+        float scale = gains[c] * brightness / MAX_SIGNAL;
+        for (int i = 0; i < LUT_SIZE; i++) {
+            float v = fminf(fmaxf((float)(i - BLACK_LEVEL) * scale, 0.0f), 1.0f);
+            float e = srgb_encode(v);
+            float s = e + LUT_CONTRAST * (e * e * (3.0f - 2.0f * e) - e);
+            luts[c][i] = (uint8_t)(s * 255.0f + 0.5f);
+        }
     }
 }
 

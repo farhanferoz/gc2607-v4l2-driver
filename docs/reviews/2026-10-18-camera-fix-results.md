@@ -92,3 +92,21 @@ exit 1 after 29 s, unit active on the good binary, idle line present. Good binar
 09-23 rebuilt by gcc 16.2.1 instead of 16.1.1): `OK` in 6.9 s.
 Driver path: the R3 install above went through the new wait and printed `OK`; its rollback path is the same
 tolerant start plus wait, not provoked separately.
+
+## Q2 Contrast on display values (2026-10-18)
+
+`build_luts()` now encodes with the sRGB curve and then mixes 0.25 of a smoothstep into the encoded value.
+`make build/test_lut && ./build/test_lut`: ok (black 0, white 255, 18% grey 116, 5% 57, never decreasing). The same
+test built against the previous `gc2607_isp.c` (from `git show HEAD:`) FAILS with 18% grey 84 and 5% 27.
+Corpus (`tools/isp_metrics.py` into `/home/ff235/cache/gc2607/replay/q2`, then `python3 tools/compare_metrics.py
+tools/baseline_metrics.json /home/ff235/cache/gc2607/replay/q2_metrics.json`), same steady-state controls:
+
+| Capture | dark_quarter | clipped | y_mean |
+|---|---|---|---|
+| normal_e600_g4 | 0.047 -> 0.117 | 0.0009 -> 0.0009 | 0.238 -> 0.344 |
+| normal_e1200_g0 | 0.051 -> 0.124 | 0.0004 -> 0.0004 | 0.242 -> 0.348 |
+| backlit2_e600_g4 (real backlight) | 0.019 -> 0.059 | 0.0069 -> 0.0068 | 0.106 -> 0.200 |
+| backlit_e600_g4 (front-lit) | 0.273 -> 0.402 | 0.0186 -> 0.0153 | 0.463 -> 0.559 |
+| texture_e600_g4 | 0.292 -> 0.419 | 0.0142 -> 0.0099 | 0.544 -> 0.619 |
+
+The darkest quarter rises on every capture and clipping never rises (the bar was at most +1 point).
