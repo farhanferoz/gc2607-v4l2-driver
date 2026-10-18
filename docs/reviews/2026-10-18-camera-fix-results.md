@@ -63,3 +63,19 @@ Deleted the leftover `[Unit]` ... `SVCEOF` block after the unit `install` line. 
 `bash -n` passes; the line after `install` is `systemctl daemon-reload`. Owner-approved full run:
 `sudo -n ./gc2607-setup-service.sh` exited 0; unit active and enabled. The /opt copies it rewrote were confirmed
 identical to the repo beforehand (scripts, ISP binary, unit, WirePlumber 50-hide-ipu6-raw.conf).
+
+## R2 Kernel-update runbook (2026-10-18)
+
+`docs/operations-runbook.md` "After a kernel update" now says: check `dkms status` for both modules, `dkms
+autoinstall -k` if one is missing, install driver changes with `gc2607-driver-install.sh`; never hand-copy into
+extra/. The old hand-build lines are gone from that section (grep count 0). `dkms status` on 7.2.11 shows
+`gc2607/1.0` and `ipu-bridge-gc2607/1.0` installed. README's upstream `init_camera.sh` path is marked historical;
+`gc2607-install.sh` now refuses to run (exit 1, pointing to DKMS) unless `GC2607_HISTORICAL_INSTALL=1`.
+
+## R3 Failed probe powers the sensor off (2026-10-18)
+
+`gc2607_power_off()` is now the first statement under `err_power:`. `make modules`: no warnings (only the usual
+pahole/BTF notes). `sudo -n ./gc2607-driver-install.sh`: DKMS built and installed for 7.2.9, 7.2.10 and 7.2.11,
+`OK` (5 min 22 s, all DKMS); `dmesg` shows `GC2607 probe successful` after the reload. The new path runs only when
+chip detection fails, which cannot be provoked on working hardware. Still owed [OWNER]: a 5-second stream, then one
+suspend/resume and a stream again.

@@ -1038,6 +1038,8 @@ static int gc2607_probe(struct i2c_client *client)
 	return 0;
 
 err_power:
+	/* put_noidle never runs the suspend callback, so power down here */
+	gc2607_power_off(gc2607);
 	pm_runtime_put_noidle(dev);
 err_pm:
 	pm_runtime_disable(dev);
