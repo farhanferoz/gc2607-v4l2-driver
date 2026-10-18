@@ -4,6 +4,7 @@
  * Captures raw 10-bit Bayer GRBG from V4L2, applies:
  *   - Lens-shading correction of the raw rows as they are read (gc2607_lsc_table.h)
  *   - Bilinear demosaic to 1920x1080 (2x2 binning to 960x540 with GC2607_ISP_HALF_RES=1)
+ *   - Chroma denoise: a 6x5-pixel mean of U and V (a 3x3 median of the binned output)
  *   - Black level subtraction
  *   - Gray-world auto white balance
  *   - Auto-exposure: one controller over exposure, analogue gain, frame length and digital gain
@@ -162,7 +163,7 @@ static uint8_t lut_b[LUT_SIZE];
 /* Output: full 1920x1080 YUYV, or the 960x540 binned fallback with GC2607_ISP_HALF_RES=1. */
 static int half_res;
 static int out_w = SENSOR_W, out_h = SENSOR_H;
-static uint8_t yuyv_buf[SENSOR_W * SENSOR_H * 2];   /* the first out_w * out_h * 2 bytes are used */
+static uint8_t yuyv_buf[SENSOR_W * SENSOR_H * 2] __attribute__((aligned(32)));   /* the first out_w * out_h * 2 bytes are used */
 
 static void select_output_size(void)
 {
@@ -319,6 +320,71 @@ static void chroma_median_filter(uint8_t *buf, int width, int height)
             }
         }
     }
+}
+
+/*
+ * Chroma denoise for the full-resolution output: U and V become their mean over 3 pairs x 5 rows
+ * (6 x 5 pixels); Y is untouched. Without it the bilinear demosaic leaves 2.3-2.6x the colour noise of
+ * the binned path (temporal chroma noise, replays 2026-10-18: dim_e2000_g8 8.63 vs 3.62,
+ * normal_e600_g4 4.31 vs 1.87), seen as coloured speckle in dim rooms. A mean, not the binned path's
+ * median: the median would cost ~24 ms per frame at this size. Rows and pairs past the border repeat
+ * the outermost one.
+ */
+#define CHROMA_BOX_ROWS 5   /* rows averaged; 3 pairs across */
+_Static_assert(CHROMA_BOX_ROWS == 5, "chroma_mean_write adds five rows by hand");
+
+/* A YUYV row as 16-bit words: little-endian, word 2i is Y0 | U << 8 and word 2i + 1 is Y1 | V << 8, so
+ * U and V are the high bytes of alternate words and every loop below runs over contiguous words and
+ * vectorises. may_alias: the words are read from and written to the uint8_t output buffer. */
+typedef uint16_t __attribute__((may_alias)) yuyv_word;
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "yuyv_word assumes little endian");
+
+/* Sum of each word's chroma and that of the same channel one pair either side, the outermost repeated. */
+static void chroma_row_sums(const yuyv_word *restrict w, uint16_t *restrict sum, int nwords)
+{
+    for (int j = 0; j < 2; j++) {
+        sum[j] = (uint16_t)(2 * (w[j] >> 8) + (w[j + 2] >> 8));
+        sum[nwords - 2 + j] = (uint16_t)((w[nwords - 4 + j] >> 8) + 2 * (w[nwords - 2 + j] >> 8));
+    }
+    for (int j = 2; j < nwords - 2; j++)
+        sum[j] = (uint16_t)((w[j - 2] >> 8) + (w[j] >> 8) + (w[j + 2] >> 8));
+}
+
+/* Replace each word's chroma with the rounded mean of five rows' sums; (s + 7) * 4370 >> 16 equals
+ * (s + 7) / 15 for every sum up to 15 x 255 (checked exhaustively). */
+static void chroma_mean_write(yuyv_word *restrict w, const uint16_t *restrict a, const uint16_t *restrict b,
+                              const uint16_t *restrict c, const uint16_t *restrict d, const uint16_t *restrict e,
+                              int nwords)
+{
+    for (int j = 0; j < nwords; j++) {
+        uint32_t m = ((uint32_t)(a[j] + b[j] + c[j] + d[j] + e[j] + 7) * 4370u) >> 16;
+        w[j] = (uint16_t)((w[j] & 0xFF) | (m << 8));
+    }
+}
+
+/*
+ * Advance the filter by one row of a frame produced row by row: sum row number `seq` (0..height-1 in
+ * the order produced) and write the mean into row seq - 2, whose neighbours are all summed by now; the
+ * last row also writes the final two. Row k sits at buf + k rows, or counted from the bottom when
+ * `bottom_up` (the demosaic writes the rotated output from the last row up). The kernel is symmetric, so
+ * the order does not change the result.
+ */
+static void chroma_box_row(uint8_t *buf, int seq, int width, int height, int bottom_up)
+{
+    static uint16_t sum[CHROMA_BOX_ROWS][SENSOR_W];   /* by row number mod CHROMA_BOX_ROWS */
+    const int nwords = width, ry = CHROMA_BOX_ROWS / 2;
+#define CHROMA_ROW(k) ((yuyv_word *)(buf + (size_t)(bottom_up ? height - 1 - (k) : (k)) * width * 2))
+
+    chroma_row_sums(CHROMA_ROW(seq), sum[seq % CHROMA_BOX_ROWS], nwords);
+    for (int y = seq - ry < 0 ? height : seq - ry; y <= (seq == height - 1 ? seq : seq - ry); y++) {
+        int r[CHROMA_BOX_ROWS];
+        for (int k = 0; k < CHROMA_BOX_ROWS; k++) {
+            int yy = y + k - ry;
+            r[k] = (yy < 0 ? 0 : (yy >= height ? height - 1 : yy)) % CHROMA_BOX_ROWS;
+        }
+        chroma_mean_write(CHROMA_ROW(y), sum[r[0]], sum[r[1]], sum[r[2]], sum[r[3]], sum[r[4]], nwords);
+    }
+#undef CHROMA_ROW
 }
 
 /*
@@ -564,6 +630,7 @@ static void demosaic_full(const uint16_t *bayer)
                             out_row + (SENSOR_W - 2 - c) * 2);
             }
         }
+        chroma_box_row(yuyv_buf, r, SENSOR_W, SENSOR_H, 1);   /* out_row is row r from the bottom */
     }
 }
 
