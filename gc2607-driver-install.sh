@@ -119,10 +119,10 @@ if ! media-ctl -d /dev/media0 -p 2>/dev/null | grep -q 'gc2607 5-0037'; then
 fi
 
 log "starting camera service..."
-systemctl start gc2607-camera.service
-sleep 2
+# A failed start job must reach the rollback below, not end the script under set -e.
+systemctl start gc2607-camera.service || true
 
-if ! systemctl is-active --quiet gc2607-camera.service; then
+if ! "$(dirname "$REPO_C")/gc2607-wait-ready.sh"; then
     log "service failed; restoring backup..."
     systemctl stop gc2607-camera.service || true
     restore_prev

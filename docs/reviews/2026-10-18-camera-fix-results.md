@@ -79,3 +79,16 @@ pahole/BTF notes). `sudo -n ./gc2607-driver-install.sh`: DKMS built and installe
 `OK` (5 min 22 s, all DKMS); `dmesg` shows `GC2607 probe successful` after the reload. The new path runs only when
 chip detection fails, which cannot be provoked on working hardware. Still owed [OWNER]: a 5-second stream, then one
 suspend/resume and a stream again.
+
+## R4 Install rollback waits for the ISP (2026-10-18)
+
+Reproduced first, and it was worse than the handover's "prints OK": with a binary that exits 1, `systemctl restart`
+itself failed (the process died during ExecStartPost), `set -e` ended `gc2607-install-isp.sh` before its rollback,
+and the bad binary stayed in /opt with the unit restarting (exit 1, no rollback, `cmp` against a saved copy: BAD).
+`gc2607-driver-install.sh` had the same `set -e` exit on its `systemctl start`. Fix: both scripts tolerate a failed
+start job and call the new `gc2607-wait-ready.sh` (up to 15 s: unit active AND the current invocation, `journalctl
+-I`, has logged `[gc2607_isp] Idle, waiting for consumers`). Same bad binary after the fix: `FAILED — rolling back`,
+exit 1 after 29 s, unit active on the good binary, idle line present. Good binary (`make -B isp`, same source as
+09-23 rebuilt by gcc 16.2.1 instead of 16.1.1): `OK` in 6.9 s.
+Driver path: the R3 install above went through the new wait and printed `OK`; its rollback path is the same
+tolerant start plus wait, not provoked separately.
