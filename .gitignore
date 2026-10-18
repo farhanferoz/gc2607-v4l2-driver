@@ -12,6 +12,8 @@ modules.order
 
 # Compiled userspace ISP binary (built from gc2607_isp.c)
 /gc2607_isp
+# Unit-test and benchmark binaries (make test / make bench)
+/build/
 
 # AI assistant instruction/config — local-only, never commit
 CLAUDE.md
