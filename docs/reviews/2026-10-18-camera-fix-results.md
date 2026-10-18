@@ -56,3 +56,10 @@ settings). Selected (display values 0..1):
 
 In the evening scenes today's pipeline is at its software-brightness ceiling and the face still renders dark
 (viewed: `replay/baseline/png/`).
+
+## R1 Setup script aborts (2026-10-18)
+
+Deleted the leftover `[Unit]` ... `SVCEOF` block after the unit `install` line. `grep -c -E '^\[Unit\]$|^SVCEOF$'` = 0;
+`bash -n` passes; the line after `install` is `systemctl daemon-reload`. Owner-approved full run:
+`sudo -n ./gc2607-setup-service.sh` exited 0; unit active and enabled. The /opt copies it rewrote were confirmed
+identical to the repo beforehand (scripts, ISP binary, unit, WirePlumber 50-hide-ipu6-raw.conf).

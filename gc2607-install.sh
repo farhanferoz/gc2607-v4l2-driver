@@ -15,6 +15,15 @@
 
 set -euo pipefail
 
+# HISTORICAL. Superseded by DKMS (dkms-setup.sh), which rebuilds both modules on every kernel update; a module
+# copied into extra/ by this script is overwritten by DKMS at the next update. Its kernel/v6.x source URLs
+# cannot work on 7.x kernels. Kept for reference only.
+if [ "${GC2607_HISTORICAL_INSTALL:-}" != 1 ]; then
+    echo "gc2607-install.sh is historical: use dkms-setup.sh and gc2607-driver-install.sh" >&2
+    echo "(see docs/operations-runbook.md, 'After a kernel update')." >&2
+    exit 1
+fi
+
 KVER="$(uname -r)"
 KVER_SHORT="${KVER%%-*}"
 MODULES_DIR="/lib/modules/${KVER}"

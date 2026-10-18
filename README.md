@@ -83,6 +83,11 @@ make
 
 ## Usage
 
+> **Historical: upstream's manual path.** On this laptop the modules are installed through DKMS
+> (`dkms-setup.sh`, rebuilt on every kernel update) and the camera runs from `gc2607-camera.service`
+> (`gc2607-setup-service.sh`); see `docs/operations-runbook.md`. `init_camera.sh` and
+> `create_virtual_camera.sh` below are not used.
+
 ### Quick Start (After Reboot)
 
 1. **Initialize the camera** (loads modules and configures everything):

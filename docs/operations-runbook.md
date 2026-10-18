@@ -47,18 +47,19 @@ sudo bash gc2607-power-measure.sh 60 "what you're testing"
 Each run appends to `docs/power-measurements.log`. Baseline (untuned, 2026-06-12): ~25.8 W (~2.65 h).
 Target after tuning: ~13–16 W (~4.5–5 h light use).
 
-### After a kernel update (rebuild the patched camera BEFORE booting the new kernel)
-The stock akmods build is NOT our patched camera path; every kernel update breaks the camera until rebuilt.
+### After a kernel update
+DKMS rebuilds both camera modules for every new kernel: `gc2607/1.0` (the sensor driver) and
+`ipu-bridge-gc2607/1.0` (the patched bridge, built from the new kernel's own source by its pre-build step).
+Do NOT hand-build or copy modules into `/lib/modules/<kver>/extra/`: DKMS overwrites them from its own source
+copy at the next update, which is how the January driver silently came back on 7.2.5-7.2.7
+(header of `gc2607-driver-install.sh`).
 ```
-K=<new-kver e.g. 7.0.13-200.fc44.x86_64>
-# 1. patched ipu-bridge:
-cp ipu-bridge-oot/7.0.12/ipu-bridge.c ipu-bridge-oot/7.0.12/Makefile ipu-bridge-oot/$K_DIR/   # new dir per kver
-make -C ipu-bridge-oot/<dir> KDIR=/usr/src/kernels/$K
-sudo bash gc2607-fix-bridge.sh $K ipu-bridge-oot/<dir>/ipu-bridge.ko
-# 2. gc2607 sensor module:
-make -C /lib/modules/$K/build M="$PWD" modules
-sudo install -d /lib/modules/$K/extra
-sudo bash -c "xz -c --check=crc32 --lzma2=dict=1MiB gc2607.ko > /lib/modules/$K/extra/gc2607.ko.xz && depmod $K"
+K=<new-kver e.g. 7.2.12-200.fc44.x86_64>
+# 1. both modules built for the new kernel?
+dkms status | grep -E 'gc2607|ipu-bridge-gc2607'     # each must say "installed" for $K
+sudo dkms autoinstall -k $K                           # only if one is missing
+# 2. changed the driver source? install it through DKMS, not by copying:
+sudo ./gc2607-driver-install.sh
 # 3. ensure the new boot entry has NO intel_idle.max_cstate cap (marker drives Phase-1b) and keep i915.enable_psr=2.
 # 4. reboot, then: bash gc2607-health.sh
 ```
