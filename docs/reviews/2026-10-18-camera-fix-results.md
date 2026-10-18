@@ -231,5 +231,6 @@ Live (`make isp && sudo -n ./gc2607-install-isp.sh`, `OK`): a 10 s ffmpeg read s
 ffmpeg opened the device and stopped **3.0 s** after it ended (bars 1 s and 5 s); `kill -9` of a streaming ffmpeg
 stopped it **3.0 s** later; `systemctl --user restart wireplumber` with no app open started **no** stream in 10 s.
 ffmpeg reported 5-6 "non monotonically increasing dts" warnings per 10 s run (repeated frames from the loopback);
-not investigated. Idle CPU: `CPUUsageNSec` 8,103,450,000 at unix 1792332618; second reading owed (bar <= 0.6 s per
-10 minutes).
+not investigated. Idle CPU (`systemctl show -p CPUUsageNSec`, same invocation, no stream started in between):
+8,103,450,000 ns at unix 1792332618, 8,370,610,000 at 1792333224, i.e. **0.27 s in 606 s, 0.26 s per 10 minutes**
+(bar 0.6 s; ~19 s before).
