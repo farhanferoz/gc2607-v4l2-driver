@@ -158,3 +158,18 @@ genuinely coloured surfaces above Y 0.98, so the old definition read as a regres
 blocks saturated at all four sites, rotated as the ISP rotates. `tools/baseline_metrics.json` is re-scored with the
 pre-fix ISP (sources from 6a3a198) and now also holds the three `room-day` captures: every other field is identical
 to the previous file (checked field by field); `hl_neutral` is 0.0 wherever a capture has saturated blocks.
+
+## D1 30 fps timing, writable VBLANK (2026-10-18)
+
+Driver: HTS 1959 and frame length 1116 in both register pairs (0x0340/41, 0x0220/21); VBLANK writable 36..1152, writing
+both pairs and re-ranging EXPOSURE to [4, frame length - 8]; PIXEL_RATE 65,368,695 Hz (1959 x 1116 x 29.90); HBLANK
+39 read-only; defaults exposure 1000, gain index 0. `make modules`: no warnings. `sudo -n ./gc2607-driver-install.sh`:
+DKMS for 7.2.9/7.2.10/7.2.11, `OK`; probe line `Format: SGRBG10 1920x1080@30fps`.
+
+- `v4l2-ctl --list-ctrls` on the sensor subdev: exposure 4..1108 default 1000, vertical_blanking 36..1152 (writable),
+  horizontal_blanking 39 (read-only), analogue_gain default 0, pixel_rate 65368695.
+- Sensor off, controls only: VBLANK 1152 -> exposure max 2224; VBLANK back to 36 with exposure 2224 -> clamped to
+  1108; exposure 2002 requested at VBLANK 36 -> 1108, no error (so the pre-Q1 ISP still runs on this driver).
+- Camera on, new `gc2607-raw-capture.sh --fps 36 1152` (300 frames each, nothing saved): **29.90 fps** at VBLANK 36
+  and **15.16 fps** at 1152 (the timing predicts 14.95; the 1.4% gap is unexplained), exposure maximum 1108 and 2224.
+  Kernel log for both windows: only stream on/off lines; no line mentioning ipu/isys/csi with err or fail this boot.

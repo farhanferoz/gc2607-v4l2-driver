@@ -37,25 +37,41 @@
 #define GC2607_REG_DGAIN_H		0x020c
 #define GC2607_REG_DGAIN_L		0x020d
 
+/* Frame length registers: the documented 0x0340/0x0341 and the reference init's 0x0220/0x0221
+ * mirror; both are written with the same value (as AlexDaichendt/gc2607-camera-linux does). */
+#define GC2607_REG_FLL_H		0x0340
+#define GC2607_REG_FLL_L		0x0341
+#define GC2607_REG_VTS_H		0x0220
+#define GC2607_REG_VTS_L		0x0221
+
+/*
+ * Sensor timing. Line length 1959 and a minimum frame length of 1116 give 29.90 fps on this
+ * board's 19.2 MHz clock with the stock PLL and no CSI errors: AlexDaichendt/gc2607-camera-linux
+ * 5febb72, gc2607-kernel/FINDINGS.md "Shipped fix (pathB)". Until 2026-10-18 this driver ran
+ * HTS 2048 / VTS 2003, measured at 16.1 fps. One line is 29.97 us.
+ */
+#define GC2607_HTS			1959
+#define GC2607_VTS			1116	/* minimum frame length: 29.90 fps */
+#define GC2607_VTS_MAX			2232	/* 15 fps, for longer exposures in dim light */
+#define GC2607_WIDTH			1920
+#define GC2607_HEIGHT			1080
+/* The readout clock (HTS x VTS x measured fps, ~65.37 MHz), which consumers use to turn lines
+ * into time; 134.4 MHz is the MIPI bus rate, which this control used to report. */
+#define GC2607_PIXEL_RATE		((s64)GC2607_HTS * GC2607_VTS * 2990 / 100)
+#define GC2607_LINK_FREQ		336000000LL  /* 672 Mbps / 2 lanes */
+
 /* Exposure and gain limits */
+#define GC2607_EXPOSURE_MARGIN		8	/* exposure must stay this far below the frame length */
 #define GC2607_EXPOSURE_MIN		4
-#define GC2607_EXPOSURE_MAX		2002	/* VTS - 1 (must be < VTS) */
+#define GC2607_EXPOSURE_MAX		(GC2607_VTS - GC2607_EXPOSURE_MARGIN)	/* re-ranged with VBLANK */
 #define GC2607_EXPOSURE_STEP		1
-#define GC2607_EXPOSURE_DEFAULT		2002	/* Tested optimal for indoor use */
+#define GC2607_EXPOSURE_DEFAULT		1000	/* 30 ms */
 
 /* Gain is controlled via LUT index (0-16), not raw register values */
 #define GC2607_GAIN_MIN			0	/* LUT index 0 = 1.0x gain */
 #define GC2607_GAIN_MAX			16	/* LUT index 16 = 15.8x gain */
 #define GC2607_GAIN_STEP		1	/* One LUT entry at a time */
-#define GC2607_GAIN_DEFAULT		14	/* LUT index 14 = ~10x gain */
-
-/* Sensor timing - modified for better low-light performance */
-#define GC2607_PIXEL_RATE		(672000000LL / 10 * 2)  /* 134.4 MHz */
-#define GC2607_LINK_FREQ		336000000LL  /* 672 Mbps / 2 lanes */
-#define GC2607_HTS			2048
-#define GC2607_VTS			2003  /* 1.5x from 1335 for 1.5x exposure (20 FPS) */
-#define GC2607_WIDTH			1920
-#define GC2607_HEIGHT			1080
+#define GC2607_GAIN_DEFAULT		0
 
 /* Register value pair for initialization sequences */
 struct gc2607_regval {
@@ -249,12 +265,12 @@ static const struct gc2607_regval gc2607_1080p_30fps_regs[] = {
 	{0x0132, 0x01},
 	{0x031c, 0x93},
 	{0x0218, 0x00},
-	{0x0340, 0x0a},
-	{0x0341, 0x6e},
-	{0x0342, 0x08},  /* HTS high byte */
-	{0x0343, 0x00},  /* HTS low byte = 2048 */
-	{0x0220, 0x07},  /* VTS high byte (2003 = 0x07d3 for 20 FPS) */
-	{0x0221, 0xd3},  /* VTS low byte */
+	{0x0340, 0x04},  /* frame length 1116 = 0x045c (VBLANK re-writes both pairs) */
+	{0x0341, 0x5c},
+	{0x0342, 0x07},  /* HTS high byte */
+	{0x0343, 0xa7},  /* HTS low byte = 1959 */
+	{0x0220, 0x04},  /* frame length mirror, 1116 */
+	{0x0221, 0x5c},
 	{0x0af4, 0x2b},
 	{0x0002, 0x30},
 	{0x00c3, 0x3c},
@@ -652,11 +668,27 @@ static int gc2607_s_ctrl(struct v4l2_ctrl *ctrl)
 	struct i2c_client *client = gc2607->client;
 	int ret = 0;
 
+	/* The frame length sets the exposure ceiling: re-range it first, even while powered off. */
+	if (ctrl->id == V4L2_CID_VBLANK)
+		__v4l2_ctrl_modify_range(gc2607->exposure, GC2607_EXPOSURE_MIN,
+					 GC2607_HEIGHT + ctrl->val - GC2607_EXPOSURE_MARGIN,
+					 GC2607_EXPOSURE_STEP, GC2607_EXPOSURE_DEFAULT);
+
 	/* Only apply controls when streaming */
 	if (pm_runtime_get_if_in_use(&client->dev) <= 0)
 		return 0;
 
 	switch (ctrl->id) {
+	case V4L2_CID_VBLANK: {
+		int fll = GC2607_HEIGHT + ctrl->val;
+
+		ret = gc2607_write_reg(gc2607, GC2607_REG_FLL_H, (fll >> 8) & 0x7f);
+		if (!ret) ret = gc2607_write_reg(gc2607, GC2607_REG_FLL_L, fll & 0xff);
+		if (!ret) ret = gc2607_write_reg(gc2607, GC2607_REG_VTS_H, (fll >> 8) & 0x3f);
+		if (!ret) ret = gc2607_write_reg(gc2607, GC2607_REG_VTS_L, fll & 0xff);
+		break;
+	}
+
 	case V4L2_CID_EXPOSURE:
 		/* Write exposure value to registers (16-bit) */
 		ret = gc2607_write_reg(gc2607, GC2607_REG_EXPOSURE_H,
@@ -932,9 +964,10 @@ static int gc2607_probe(struct i2c_client *client)
 	/*
 	 * HBLANK and VBLANK — mandatory under libcamera's sensor driver
 	 * requirements (HBLANK lets libcamera compute line time; VBLANK
-	 * lets it compute frame rate and exposure-vs-frame headroom). Both
-	 * are read-only since this driver currently runs the sensor in a
-	 * single fixed mode (1920x1080 @ HTS=2048, VTS=2003).
+	 * lets it compute frame rate and exposure-vs-frame headroom).
+	 * HBLANK is fixed (one line length). VBLANK is writable from 36
+	 * (29.9 fps) to 1152 (15 fps) so dim light can take longer
+	 * exposures; writing it re-ranges EXPOSURE.
 	 */
 	gc2607->hblank = v4l2_ctrl_new_std(&gc2607->ctrls,
 					   &gc2607_ctrl_ops,
@@ -950,11 +983,9 @@ static int gc2607_probe(struct i2c_client *client)
 					   &gc2607_ctrl_ops,
 					   V4L2_CID_VBLANK,
 					   GC2607_VTS - GC2607_HEIGHT,
-					   GC2607_VTS - GC2607_HEIGHT,
+					   GC2607_VTS_MAX - GC2607_HEIGHT,
 					   1,
 					   GC2607_VTS - GC2607_HEIGHT);
-	if (gc2607->vblank)
-		gc2607->vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/*
 	 * Parse fwnode (ACPI _DSD / DT) properties for orientation and

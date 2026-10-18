@@ -8,6 +8,7 @@
 #   sudo ./gc2607-raw-capture.sh --session          guided corpus: prompts for each scene, then --latency
 #   sudo ./gc2607-raw-capture.sh [--frames N] SCENE EXP:GAIN[:VBLANK] [EXP:GAIN[:VBLANK] ...]
 #   sudo ./gc2607-raw-capture.sh --latency
+#   sudo ./gc2607-raw-capture.sh --fps VBLANK [VBLANK ...]   frame rate at each vertical blanking (D1)
 #   add --dry-run to any form to only discover devices and check arguments
 #
 # SCENE: a short label ([a-z0-9_-]). EXP: exposure lines; GAIN: analogue gain table index (0-16);
@@ -44,6 +45,7 @@ while [ $# -gt 0 ]; do
         --dry-run) dry_run=1; shift ;;
         --latency) mode=latency; shift ;;
         --session) mode=session; shift ;;
+        --fps) mode=fps; shift ;;
         *) break ;;
     esac
 done
@@ -64,6 +66,9 @@ case "$mode" in
         [ $# -ge 2 ] || die "usage: $0 [--frames N] [--dry-run] SCENE EXP:GAIN[:VBLANK] ..."
         [[ "$1" =~ ^[a-z0-9_-]{1,32}$ ]] || die "SCENE must match [a-z0-9_-]{1,32}"
         for s in "${@:2}"; do check_setting "$s"; done ;;
+    fps)
+        [ $# -ge 1 ] || die "usage: $0 --fps VBLANK [VBLANK ...]"
+        for v in "$@"; do [[ "$v" =~ ^[0-9]{1,4}$ ]] || die "bad VBLANK '$v'"; done ;;
     latency|session)
         [ -x "$REPO/build/ae_latency" ] || die "build it first: make build/ae_latency" ;;
 esac
@@ -120,6 +125,20 @@ EOF
     done
 }
 
+# fps VBLANK...: stream 300 frames at each vertical blanking without saving them; print the rate
+# v4l2-ctl measured, the exposure maximum the driver now allows, and new CSI errors in the kernel log.
+fps() {
+    local vb before csi_errors='(csi|crc).*(err|fail)|(err|fail).*(csi|crc)'
+    for vb in "$@"; do
+        before=$(dmesg | grep -ciE "$csi_errors" || true)
+        as_owner v4l2-ctl -d "$SUBDEV" --set-ctrl="vertical_blanking=$vb"
+        log "vertical_blanking=$vb: $(as_owner v4l2-ctl -d "$SUBDEV" --list-ctrls | grep -E '^ *(exposure|vertical_blanking) ' | tr -s ' ' | tr '\n' ';')"
+        as_owner v4l2-ctl -d "$CAPTURE_DEV" --set-fmt-video=width=1920,height=1080,pixelformat=BA10 \
+            --stream-mmap=4 --stream-count=300 2>&1 | grep -oE '[0-9.]+ fps' | tail -1 | sed 's/^/[raw-capture] measured: /'
+        log "new CSI error lines in the kernel log: $(( $(dmesg | grep -ciE "$csi_errors" || true) - before ))"
+    done
+}
+
 latency() {
     local what
     for what in exposure gain; do as_owner "$REPO/build/ae_latency" "$CAPTURE_DEV" "$SUBDEV" "$what" || true; done
@@ -134,6 +153,7 @@ media-ctl -d "$MEDIA_DEV" -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 
 case "$mode" in
     capture) capture "$@" ;;
     latency) latency ;;
+    fps) fps "$@" ;;
     session)
         n=0
         for entry in "${SESSION[@]}"; do
