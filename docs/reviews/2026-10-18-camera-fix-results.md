@@ -258,13 +258,12 @@ restarting it" (node 114 kept, WirePlumber start time unchanged); the boot simul
 camera; restarted it" and the camera was listed and read 30 frames. The full setup no longer restarts WirePlumber
 itself. Still owed [OWNER]: one suspend/resume (with R3's) and a browser camera test.
 
-**Found on the way, not fixed: a PipeWire client gets no frames from the camera.** `gst-launch-1.0 pipewiresrc`
-(auto-linked: "target not found"; linked by hand with `pw-link`: no buffers, ISP never saw a reader). PipeWire's log:
-`(60.0.0 -> 115.0.0) allocating -> error error alloc buffers: Operation not supported (-95)`; at log level 4 the camera
-node offered buffers with dataType mask 8, i.e. DmaBuf only (1 << SPA_DATA_DmaBuf). PipeWire 1.6.9, WirePlumber 0.5.18, v4l2loopback 0.15.4. Not caused
-by E2 (the module was not reloaded); whether it ever worked is unknown: 60 days of PipeWire logs hold no earlier
-attempt. Apps that open /dev/video50 directly (ffmpeg; browsers without PipeWire camera support) are unaffected;
-apps that go through PipeWire (GNOME Snapshot, a browser with PipeWire camera on) would show no picture.
+**A test-pipeline failure, not a camera fault (corrected the same day).** `gst-launch-1.0 pipewiresrc ! fakesink` got no
+frames (auto-linked: "target not found"; linked by hand: PipeWire logged `error alloc buffers: Operation not supported
+(-95)`, with the camera node's buffer parameters naming DmaBuf only, dataType mask 8). GNOME Snapshot 50.0, which opens the
+camera through the portal (`org.freedesktop.portal.Camera.OpenPipeWireRemote` in its log) and so through PipeWire,
+showed a picture at 16:21 with no PipeWire error: the failure belongs to that test pipeline's buffer negotiation.
+A PipeWire stream check needs a real client (Snapshot), not `fakesink`.
 
 ## S1 Pipeline discovery by the graph's links (2026-10-18)
 
@@ -345,3 +344,41 @@ Corpus (`isp_replay` against C1, `/home/ff235/cache/gc2607/replay/{c1,q9}_metric
 kept red gain 1.27 where grey world asked 0.70, so it renders red instead of grey (chroma 31.9 -> 43.4), and the opaque
 cover's noise no longer sets the gains. The corpus has no grey patch inside a one-colour scene, so the cast reduction
 itself is shown by the unit test only. Live after `gc2607-install-isp.sh`: WB R 2.16, B 1.90, Y 0.456, 29.2 fps.
+
+## Q1 live: light changes, backlight, flicker (2026-10-18 16:15-16:27, owner at the laptop)
+
+Light changes (180 s ffmpeg read, a frame saved every 5 s to `/home/ff235/cache/gc2607/q1-live/`): room light 30 ms,
+gain index 3, 29.9 fps; lights off 60 ms, index 15, frame length 2012 (16.8 fps); lights on (a warmer light than at the
+start) back to 30 ms within one status line (~5-7 s), index 15 -> 8 -> 7; back to the starting light: index 1, 29.9 fps.
+Exposure lowered twice, so no ratchet; Y 0.44-0.46 in every phase; d 1.01-1.28, never below 1; 0 failed control writes.
+One saved frame (the second the lights came on) is washed out; the next, 5 s later, is normal. The handover's "gain index
+back to 0" does not apply as written: this room in the evening needs index 1-3 at 30 ms.
+
+Backlight (desk lamp in frame behind the owner, 32 s): Y 0.409-0.416 (floor 0.30), 1.7% of samples clipped (the lamp),
+P98 0.89-0.94, 60 ms at index 13 in a dim room; the face is clearly visible in all six saved frames.
+
+Flicker (`gc2607-raw-capture.sh flicker 450:8:36 668:6:36`, a light wall under the ceiling LEDs, ~60 counts of green
+signal): the handover's metric (cubic-detrended row means, one frame) reads 14.0% and 13.7%, the wall's own shading, so
+it cannot answer the question on a real surface. Dividing each frame's green row profile by the 5-frame mean cancels the
+static scene and keeps the banding that moves (a frame is 33.45 ms, the light's period 10 ms): at 450 lines (13.5 ms)
+the 10 ms component is 1.09-1.48% per frame, ~30x the rest of the spectrum (0.04%); at 668 lines (20.0 ms, two whole
+periods) 0.11-0.28%. **The room lights flicker at 100 Hz and whole-period exposures cut the banding ~6x.**
+
+## Q8 measurement: lens shading (2026-10-18 ~16:30, owner at the laptop)
+
+White printer paper flat over the lens. Facing a desk lamp 1-2 m away (`flatfield_e{40,120,360,1000}_g0_vb36`): only
+18 counts of green at 33 ms, too dim to trust, and a lamp seen through paper could make a centred hot spot with the
+same shape. Facing daylight through a window (`dayflat_e400_g0`, `_e1100_g0`, `_g2`, `_g4`, all `_vb36`, 42-233 counts
+mean, 0% clipped; a first set at gain index 10-16 clipped 12-73% and was deleted): corner/centre (`raw_metrics`, corner
+windows 1/20 of each side) 0.21-0.24 on every channel at every setting (gr 0.213-0.227, r 0.227-0.241, b 0.215-0.227).
+Green over a 5x5 grid, relative to the centre cell, at 1100 lines index 2:
+
+    0.30 0.51 0.66 0.53 0.30
+    0.36 0.67 0.90 0.68 0.37
+    0.40 0.78 1.00 0.77 0.40
+    0.40 0.73 0.91 0.72 0.39
+    0.36 0.60 0.71 0.59 0.33
+
+The lamp capture gave the same ring within a few hundredths, so the falloff belongs to the lens, not the light. It is
+mostly luminance (the channels within ~0.03 of each other); the bottom row is ~0.05 brighter than the top, likely the
+window's own gradient. Every channel is far below the handover's 0.8 trigger: Q8's correction is warranted.
