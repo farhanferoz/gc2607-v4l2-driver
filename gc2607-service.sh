@@ -2,13 +2,12 @@
 #
 # GC2607 Camera Service Script
 # Called by systemd gc2607-camera.service at boot.
-# Sets up the full pipeline and starts the Python virtualcam.
+# Sets up the pipeline and v4l2loopback, then runs the ISP (or the Python fallback).
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KVER="$(uname -r)"
 
 log() { echo "[gc2607] $*"; }
 die() { echo "[gc2607] ERROR: $*" >&2; exit 1; }
@@ -19,55 +18,16 @@ log "Loading kernel modules..."
 for mod in videodev v4l2-async ipu_bridge intel-ipu6 intel-ipu6-isys; do
     modprobe "$mod" 2>/dev/null || true
 done
-sleep 1
+# Built for each kernel by DKMS; /etc/modules-load.d/gc2607.conf normally loads it at boot already.
+modprobe gc2607 || die "the gc2607 module would not load (check: dkms status | grep gc2607)"
 
-# Load gc2607
-if ! grep -q "^gc2607 " /proc/modules; then
-    if [ -f "/lib/modules/${KVER}/extra/gc2607.ko" ] || [ -f "/lib/modules/${KVER}/extra/gc2607.ko.xz" ]; then
-        modprobe gc2607
-    elif [ -f "${SCRIPT_DIR}/gc2607.ko" ]; then
-        insmod "${SCRIPT_DIR}/gc2607.ko"
-    else
-        die "gc2607.ko not found"
-    fi
-fi
-sleep 2
+# ── Find and Configure the Pipeline ─────────────────────────────────
 
-# ── Verify Sensor ───────────────────────────────────────────────────
-
-if ! grep -q "^gc2607 " /proc/modules; then
-    die "gc2607 module not loaded"
-fi
-
-MEDIA_DEV=""
-for dev in /dev/media*; do
-    if media-ctl -d "$dev" --print-topology 2>/dev/null | grep -qi "gc2607"; then
-        MEDIA_DEV="$dev"
-        break
-    fi
-done
-
-if [ -z "$MEDIA_DEV" ]; then
-    die "GC2607 not in media topology"
-fi
-log "Sensor on $MEDIA_DEV"
-
-# ── Configure Pipeline ──────────────────────────────────────────────
-
-CAPTURE_DEV=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null \
-    | grep -A3 "Intel IPU6 ISYS Capture 0" \
-    | grep -o "/dev/video[0-9]*" | head -1) || true
-
-if [ -z "$CAPTURE_DEV" ]; then
-    die "Could not find capture device"
-fi
-log "Capture device: $CAPTURE_DEV"
-
-media-ctl -d "$MEDIA_DEV" -V '"Intel IPU6 CSI2 0":0 [fmt:SGRBG10_1X10/1920x1080]'
-media-ctl -d "$MEDIA_DEV" -V '"Intel IPU6 CSI2 0":1 [fmt:SGRBG10_1X10/1920x1080]'
-media-ctl -d "$MEDIA_DEV" -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null
-v4l2-ctl -d "$CAPTURE_DEV" --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-
+# shellcheck source=gc2607-media.sh
+source "${SCRIPT_DIR}/gc2607-media.sh"
+media_discover 20 || die "no GC2607 pipeline in the media graph after 20 s"
+log "Sensor '$SENSOR' on $MEDIA_DEV -> '$CSI' -> '$CAPTURE' ($CAPTURE_DEV)"
+media_configure || die "could not configure the pipeline"
 log "Pipeline configured"
 
 # ── v4l2loopback ────────────────────────────────────────────────────

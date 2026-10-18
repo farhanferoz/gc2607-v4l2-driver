@@ -23,7 +23,7 @@ install_unit() {
 # from the next service start (the ISP binary has its own installer, gc2607-install-isp.sh).
 install_scripts() {
     mkdir -p "$INSTALL_DIR"
-    install -m 0755 "${SCRIPT_DIR}/gc2607_virtualcam.py" "${SCRIPT_DIR}/gc2607-service.sh" \
+    install -m 0755 "${SCRIPT_DIR}/gc2607_virtualcam.py" "${SCRIPT_DIR}/gc2607-service.sh" "${SCRIPT_DIR}/gc2607-media.sh" \
         "${SCRIPT_DIR}/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
     sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" "$INSTALL_DIR/gc2607-service.sh"
 }

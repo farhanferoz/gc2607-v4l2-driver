@@ -78,24 +78,14 @@ last=$(journalctl -u "$SERVICE" -b -o cat --no-pager 2>/dev/null \
     | grep -E 'starting stream|stopping stream|Idle, waiting for consumers|Starting with lazy' | tail -1 || true)
 case "$last" in *"starting stream"*) die "an app is using the camera; close it first" ;; esac
 
-# Media device and capture node: the same discovery as gc2607-service.sh.
-MEDIA_DEV=""
-for dev in /dev/media*; do
-    if media-ctl -d "$dev" --print-topology 2>/dev/null | grep -qi "gc2607"; then MEDIA_DEV="$dev"; break; fi
-done
-[ -n "$MEDIA_DEV" ] || die "GC2607 not in the media topology"
-CAPTURE_DEV=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null \
-    | grep -A3 "Intel IPU6 ISYS Capture 0" | grep -o "/dev/video[0-9]*" | head -1) || true
-[ -n "$CAPTURE_DEV" ] || die "capture node not found"
-SUBDEV=""
-for d in /dev/v4l-subdev*; do
-    if v4l2-ctl -d "$d" --list-ctrls 2>/dev/null | grep -qw exposure; then SUBDEV="$d"; break; fi
-done
-[ -n "$SUBDEV" ] || die "sensor subdev (the one with an exposure control) not found"
-log "media $MEDIA_DEV, capture $CAPTURE_DEV, sensor $SUBDEV"
+# Media device, capture node and sensor subdev: the same discovery as gc2607-service.sh.
+# shellcheck source=gc2607-media.sh
+source "$REPO/gc2607-media.sh"
+media_discover 5 || die "no GC2607 pipeline in the media graph"
+log "media $MEDIA_DEV, capture $CAPTURE_DEV, sensor $SENSOR_SUBDEV"
 if [ "$dry_run" -eq 1 ]; then
     log "dry run ($mode): would stop $SERVICE and stream the camera"
-    v4l2-ctl -d "$SUBDEV" --list-ctrls | grep -E 'exposure|analogue_gain|vertical_blanking|pixel_rate'
+    v4l2-ctl -d "$SENSOR_SUBDEV" --list-ctrls | grep -E 'exposure|analogue_gain|vertical_blanking|pixel_rate'
     exit 0
 fi
 
@@ -110,12 +100,12 @@ capture() {
         IFS=: read -r exp gain vb <<< "$s"
         name="${scene}_e${exp}_g${gain}${vb:+_vb${vb}}"
         ctrls="exposure=${exp},analogue_gain=${gain}${vb:+,vertical_blanking=${vb}}"
-        as_owner v4l2-ctl -d "$SUBDEV" --set-ctrl="$ctrls"
+        as_owner v4l2-ctl -d "$SENSOR_SUBDEV" --set-ctrl="$ctrls"
         as_owner v4l2-ctl -d "$CAPTURE_DEV" --set-fmt-video=width=1920,height=1080,pixelformat=BA10 \
             --stream-mmap=4 --stream-skip=10 --stream-count="$frames" --stream-to="$out_dir/$name.raw"
         size=$(stat -c %s "$out_dir/$name.raw")
         [ "$size" -eq $((frames * FRAME_BYTES)) ] || die "$name.raw is $size bytes, expected $((frames * FRAME_BYTES))"
-        readback=$(as_owner v4l2-ctl -d "$SUBDEV" --get-ctrl=exposure,analogue_gain | tr '\n' ' ')
+        readback=$(as_owner v4l2-ctl -d "$SENSOR_SUBDEV" --get-ctrl=exposure,analogue_gain | tr '\n' ' ')
         as_owner tee "$out_dir/$name.json" > /dev/null <<EOF
 {"scene": "$scene", "exposure": $exp, "gain_index": $gain, "vblank": ${vb:-null}, "frames": $frames,
  "width": 1920, "height": 1080, "format": "SGRBG10 in uint16 LE", "skipped": 10,
@@ -131,8 +121,8 @@ fps() {
     local vb before csi_errors='(csi|crc).*(err|fail)|(err|fail).*(csi|crc)'
     for vb in "$@"; do
         before=$(dmesg | grep -ciE "$csi_errors" || true)
-        as_owner v4l2-ctl -d "$SUBDEV" --set-ctrl="vertical_blanking=$vb"
-        log "vertical_blanking=$vb: $(as_owner v4l2-ctl -d "$SUBDEV" --list-ctrls | grep -E '^ *(exposure|vertical_blanking) ' | tr -s ' ' | tr '\n' ';')"
+        as_owner v4l2-ctl -d "$SENSOR_SUBDEV" --set-ctrl="vertical_blanking=$vb"
+        log "vertical_blanking=$vb: $(as_owner v4l2-ctl -d "$SENSOR_SUBDEV" --list-ctrls | grep -E '^ *(exposure|vertical_blanking) ' | tr -s ' ' | tr '\n' ';')"
         as_owner v4l2-ctl -d "$CAPTURE_DEV" --set-fmt-video=width=1920,height=1080,pixelformat=BA10 \
             --stream-mmap=4 --stream-count=300 2>&1 | grep -oE '[0-9.]+ fps' | tail -1 | sed 's/^/[raw-capture] measured: /'
         log "new CSI error lines in the kernel log: $(( $(dmesg | grep -ciE "$csi_errors" || true) - before ))"
@@ -141,14 +131,12 @@ fps() {
 
 latency() {
     local what
-    for what in exposure gain; do as_owner "$REPO/build/ae_latency" "$CAPTURE_DEV" "$SUBDEV" "$what" || true; done
+    for what in exposure gain; do as_owner "$REPO/build/ae_latency" "$CAPTURE_DEV" "$SENSOR_SUBDEV" "$what" || true; done
 }
 
 systemctl stop "$SERVICE"
 trap 'systemctl start "$SERVICE" && log "$SERVICE started again"' EXIT
-media-ctl -d "$MEDIA_DEV" -V '"Intel IPU6 CSI2 0":0 [fmt:SGRBG10_1X10/1920x1080]'
-media-ctl -d "$MEDIA_DEV" -V '"Intel IPU6 CSI2 0":1 [fmt:SGRBG10_1X10/1920x1080]'
-media-ctl -d "$MEDIA_DEV" -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null || true
+media_configure || die "could not configure the pipeline"
 
 case "$mode" in
     capture) capture "$@" ;;

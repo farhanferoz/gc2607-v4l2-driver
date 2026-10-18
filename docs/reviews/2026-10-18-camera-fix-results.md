@@ -265,3 +265,21 @@ node offered buffers with dataType mask 8, i.e. DmaBuf only (1 << SPA_DATA_DmaBu
 by E2 (the module was not reloaded); whether it ever worked is unknown: 60 days of PipeWire logs hold no earlier
 attempt. Apps that open /dev/video50 directly (ffmpeg; browsers without PipeWire camera support) are unaffected;
 apps that go through PipeWire (GNOME Snapshot, a browser with PipeWire camera on) would show no picture.
+
+## S1 Pipeline discovery by the graph's links (2026-10-18)
+
+New `gc2607-media.sh`, sourced by `gc2607-service.sh` and `gc2607-raw-capture.sh` (installed to /opt by the setup's
+`scripts` step): finds the media device holding an entity named `gc2607 *`, follows the sensor's pad-0 link to its
+CSI2 receiver and the receiver's pad-1 link to the capture entity, and resolves the capture node and sensor subdev with
+`media-ctl -e`, retrying every 0.5 s (service: up to 20 s) instead of the fixed 1 s + 2 s sleeps. One
+`media_configure` sets the formats and link for both scripts. The service's `insmod` fallback from /opt (no .ko is ever
+installed there) became a plain `modprobe gc2607`. Antonbiluta's `gc2607-isp-start.sh` (the handover's model) takes the
+first CSI2 and capture entity by name pattern; following the links names the ones the sensor is wired to.
+
+- Discovery on the laptop: `gc2607 5-0037` on /dev/media0 -> `Intel IPU6 CSI2 0` -> `Intel IPU6 ISYS Capture 0`,
+  /dev/video0, sensor /dev/v4l-subdev6 (the values the hard-coded names gave). The receiver's pad 2 resolves to
+  Capture 1, an unknown entity to nothing, and with the link parser stubbed out `media_discover 2` returns 1 after 2 s.
+- Service restart: "Loading kernel modules" to the ISP's idle line in **0.09 s** (was 3.1 s); the stream starts and
+  ffmpeg reads 30 frames; WirePlumber not restarted. `gc2607-raw-capture.sh --fps 36`: 29.90 fps, 0 new CSI error
+  lines, service back and listed.
+- Still owed [OWNER]: the stream starting first time on 3 boots/resumes.
