@@ -10,8 +10,8 @@
  *   - 180° rotation
  * Outputs YUYV to v4l2loopback.
  *
- * Lazy activation: the ISP idles with zero CPU usage until a consumer
- * application opens /dev/video50. When all consumers close the device,
+ * Lazy activation: the ISP waits in poll() until an application streams from
+ * /dev/video50 (v4l2loopback's client-usage event). When the last one stops,
  * the ISP stops streaming and releases the sensor hardware.
  *
  * Usage: gc2607_isp <capture_dev> <output_dev>
@@ -92,40 +92,6 @@
 /* Green-channel histogram for the highlight cap. */
 #define HISTOGRAM_BINS      64
 #define HIST_BIN_WIDTH      (LUT_SIZE / HISTOGRAM_BINS)
-
-/*
- * Local tone mapping (LTM) — per-pixel Y compression based on local
- * luminance. The same tool the IPU6 hardware ISP uses for WDR; we do it
- * in software at the end of the pipeline. Bright local regions (window,
- * walls) get scaled toward LTM_TARGET_Y; dark regions (face in shadow)
- * pass through unchanged. Decouples exposure choice from output dynamic
- * range, which is the only reliable way to handle bright-background +
- * shadowed-subject scenes without a multi-shot HDR sensor.
- *
- * Grid is HALF_W/HALF_H downsampled by ~16; bilinearly upsampled when
- * applied. Temporal EMA prevents per-frame flicker.
- */
-#define LTM_GRID_X          60          /* ~HALF_W/16 */
-#define LTM_GRID_Y          34          /* ~HALF_H/16 (rounded up) */
-#define LTM_CELL_W          (HALF_W / LTM_GRID_X)
-#define LTM_CELL_H          ((HALF_H + LTM_GRID_Y - 1) / LTM_GRID_Y)
-#define LTM_TARGET_Y        128.0f      /* compress bright cells toward this Y */
-#define LTM_KNEE            120.0f      /* cells with mean Y below this: identity */
-#define LTM_STRENGTH        0.7f        /* 0=no compression, 1=hard */
-/* Temporal blend = 1.0 means no EMA — fresh grid every frame. The lower
- * values that seem theoretically nicer in fact carry the previous frame's
- * grid into the current frame, and when the subject moves the old grid
- * leaves a ghost (cells that were "face/low compression" stay low while
- * the wall has moved into them, leaving a face-shaped bright patch).
- * Webcam scenes are static enough that fresh-each-frame is stable. */
-#define LTM_TEMPORAL_BLEND  1.0f
-/* Bilateral filter on the grid. Spatial sigma in cells; range sigma in Y
- * units. The range term is what kills the halo: cells across a face/wall
- * boundary differ by ~80-120 Y, far beyond LTM_BF_SIGMA_R, so the filter
- * refuses to average them — each side keeps its own compression factor. */
-#define LTM_BF_RADIUS       2           /* 5x5 kernel */
-#define LTM_BF_SIGMA_S      1.5f
-#define LTM_BF_SIGMA_R      30.0f
 
 /* Sensor hardware limits */
 #define EXPOSURE_MIN    4
@@ -725,163 +691,6 @@ static int ae_step(struct ae_state *s, float factor, struct ae_hw *write)
     return 1;
 }
 
-/*
- * Local Tone Mapping: compress bright local regions of the YUYV buffer
- * while preserving dark regions. Operates on Y only (UV untouched).
- *
- * Algorithm (Reinhard local with Gaussian-instead-of-bilateral):
- *   1. Build a downsampled Y mean per LTM_GRID cell.
- *   2. EMA-blend with the previous frame's grid for temporal stability.
- *   3. Per cell, derive a compression FACTOR (1.0 below LTM_KNEE, falling
- *      hyperbolically above).
- *   4. Per output pixel, bilinearly sample the factor grid and scale Y.
- *
- * This is the same approach used in libcamera/RPi software ISPs and in
- * IPU6 hardware WDR — local-luma-driven compression of bright regions
- * without touching the local contrast (the multiplicative scale keeps
- * pixel-to-pixel variation intact).
- */
-static void apply_ltm(uint8_t *buf, int w, int h)
-{
-    static uint64_t cell_sum[LTM_GRID_Y * LTM_GRID_X];
-    static uint32_t cell_count[LTM_GRID_Y * LTM_GRID_X];
-    static float ltm_grid[LTM_GRID_Y * LTM_GRID_X];
-    static float factor_grid[LTM_GRID_Y * LTM_GRID_X];
-    static int ltm_initialized = 0;
-
-    int row_bytes = w * 2;  /* YUYV: 2 bytes per pixel */
-
-    /* 1. Downsample: sum Y values into grid cells. */
-    for (int i = 0; i < LTM_GRID_Y * LTM_GRID_X; i++) {
-        cell_sum[i] = 0;
-        cell_count[i] = 0;
-    }
-    for (int y = 0; y < h; y++) {
-        int gy = y / LTM_CELL_H;
-        if (gy >= LTM_GRID_Y) gy = LTM_GRID_Y - 1;
-        const uint8_t *row = buf + y * row_bytes;
-        int gy_base = gy * LTM_GRID_X;
-        for (int x = 0; x < w; x++) {
-            int gx = x / LTM_CELL_W;
-            if (gx >= LTM_GRID_X) gx = LTM_GRID_X - 1;
-            int idx = gy_base + gx;
-            cell_sum[idx] += row[x * 2];   /* Y is at byte offset 2*x */
-            cell_count[idx]++;
-        }
-    }
-
-    /* 2a. Per-cell mean with temporal EMA. */
-    for (int i = 0; i < LTM_GRID_Y * LTM_GRID_X; i++) {
-        float mean = cell_count[i] > 0
-                        ? (float)cell_sum[i] / (float)cell_count[i]
-                        : 128.0f;
-        if (!ltm_initialized) {
-            ltm_grid[i] = mean;
-        } else {
-            ltm_grid[i] = (1.0f - LTM_TEMPORAL_BLEND) * ltm_grid[i]
-                        + LTM_TEMPORAL_BLEND * mean;
-        }
-    }
-    ltm_initialized = 1;
-
-    /* 2b. Joint bilateral smoothing of the grid. A plain blur (box or
-     * Gaussian) averages bright-wall cells with shadowed-face cells
-     * across the silhouette boundary; the per-pixel bilinear upsample
-     * then renders that mixed factor as a visible halo. The bilateral
-     * weight kernel multiplies the spatial Gaussian by a range Gaussian
-     * on the centre-vs-neighbour luma difference, so cells across a
-     * sharp luma edge contribute ~0 weight. Smoothing remains aggressive
-     * inside flat regions, but stops at edges — no halo. */
-    static float bf_spatial[(2 * LTM_BF_RADIUS + 1) * (2 * LTM_BF_RADIUS + 1)];
-    static int bf_initialized = 0;
-    if (!bf_initialized) {
-        float two_ss = 2.0f * LTM_BF_SIGMA_S * LTM_BF_SIGMA_S;
-        for (int dy = -LTM_BF_RADIUS; dy <= LTM_BF_RADIUS; dy++) {
-            for (int dx = -LTM_BF_RADIUS; dx <= LTM_BF_RADIUS; dx++) {
-                float d2 = (float)(dx * dx + dy * dy);
-                int k = (dy + LTM_BF_RADIUS) * (2 * LTM_BF_RADIUS + 1)
-                      + (dx + LTM_BF_RADIUS);
-                bf_spatial[k] = expf(-d2 / two_ss);
-            }
-        }
-        bf_initialized = 1;
-    }
-    static float smooth_grid[LTM_GRID_Y * LTM_GRID_X];
-    float two_sr = 2.0f * LTM_BF_SIGMA_R * LTM_BF_SIGMA_R;
-    for (int gy = 0; gy < LTM_GRID_Y; gy++) {
-        for (int gx = 0; gx < LTM_GRID_X; gx++) {
-            float centre = ltm_grid[gy * LTM_GRID_X + gx];
-            float wsum = 0, vsum = 0;
-            for (int dy = -LTM_BF_RADIUS; dy <= LTM_BF_RADIUS; dy++) {
-                int yy = gy + dy;
-                if (yy < 0 || yy >= LTM_GRID_Y) continue;
-                for (int dx = -LTM_BF_RADIUS; dx <= LTM_BF_RADIUS; dx++) {
-                    int xx = gx + dx;
-                    if (xx < 0 || xx >= LTM_GRID_X) continue;
-                    float v = ltm_grid[yy * LTM_GRID_X + xx];
-                    float diff = v - centre;
-                    int k = (dy + LTM_BF_RADIUS) * (2 * LTM_BF_RADIUS + 1)
-                          + (dx + LTM_BF_RADIUS);
-                    float w = bf_spatial[k] * expf(-(diff * diff) / two_sr);
-                    wsum += w;
-                    vsum += w * v;
-                }
-            }
-            smooth_grid[gy * LTM_GRID_X + gx] = vsum / wsum;
-        }
-    }
-
-    /* 2c. Derive per-cell compression factors from the smoothed grid. */
-    for (int i = 0; i < LTM_GRID_Y * LTM_GRID_X; i++) {
-        float L = smooth_grid[i];
-        float factor;
-        if (L <= LTM_KNEE) {
-            factor = 1.0f;
-        } else {
-            float over = L - LTM_KNEE;
-            factor = LTM_TARGET_Y / (LTM_TARGET_Y + over * LTM_STRENGTH);
-        }
-        factor_grid[i] = factor;
-    }
-
-    /* 3. Apply per-pixel: bilinearly sample factor grid, multiply Y. */
-    for (int y = 0; y < h; y++) {
-        float fy = (y + 0.5f) / (float)LTM_CELL_H - 0.5f;
-        if (fy < 0) fy = 0;
-        if (fy > LTM_GRID_Y - 1) fy = LTM_GRID_Y - 1;
-        int gy0 = (int)fy;
-        int gy1 = gy0 + 1;
-        if (gy1 >= LTM_GRID_Y) gy1 = LTM_GRID_Y - 1;
-        float wy = fy - gy0;
-        float iwy = 1.0f - wy;
-
-        uint8_t *row = buf + y * row_bytes;
-        for (int x = 0; x < w; x++) {
-            float fx = (x + 0.5f) / (float)LTM_CELL_W - 0.5f;
-            if (fx < 0) fx = 0;
-            if (fx > LTM_GRID_X - 1) fx = LTM_GRID_X - 1;
-            int gx0 = (int)fx;
-            int gx1 = gx0 + 1;
-            if (gx1 >= LTM_GRID_X) gx1 = LTM_GRID_X - 1;
-            float wx = fx - gx0;
-            float iwx = 1.0f - wx;
-
-            float f00 = factor_grid[gy0 * LTM_GRID_X + gx0];
-            float f01 = factor_grid[gy0 * LTM_GRID_X + gx1];
-            float f10 = factor_grid[gy1 * LTM_GRID_X + gx0];
-            float f11 = factor_grid[gy1 * LTM_GRID_X + gx1];
-            float factor = iwx * iwy * f00 + wx * iwy * f01
-                         + iwx * wy  * f10 + wx * wy  * f11;
-
-            int y_old = row[x * 2];
-            int y_new = (int)(y_old * factor + 0.5f);
-            if (y_new < 16) y_new = 16;
-            if (y_new > 235) y_new = 235;
-            row[x * 2] = (uint8_t)y_new;
-        }
-    }
-}
-
 /* Find the V4L2 subdevice that has exposure control (the sensor) */
 static int find_sensor_subdev(char *path, size_t pathlen)
 {
@@ -1220,17 +1029,6 @@ static int streaming_loop(const char *capture_dev, int out_fd,
         wb_gains(wb_r_rel, wb_b_rel, wb);
         struct frame_stats st;
         process_frame(bayer, wb, ae.cur.d, &st);
-
-        /* LTM permanently disabled. Both KNEE=120 (Y-threshold inside
-         * skin midtones) and KNEE=200 (only true highlights) produce
-         * visible forehead patches when the user moves — any frame in
-         * which skin luma crosses the knee shifts the cell-grid factor
-         * boundary, which the bilinear factor upsample renders as a
-         * moving artefact. The bilateral grid smoothing fixes silhouette
-         * halos but is powerless against this in-skin transition. The
-         * fundamental problem is "hard threshold on a coarse grid against
-         * a textured signal" — no knee value escapes it on face skin. */
-        (void)apply_ltm;
 
         /* White balance: grey world, unsmoothed for a session's first frames */
         float r_rel, b_rel;

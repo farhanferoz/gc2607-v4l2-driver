@@ -297,3 +297,27 @@ two authors in the file's git history in place of the "Your Name" placeholder.
 `OK` in 319 s; `/usr/src/gc2607-1.0/gc2607.c` = the working tree (md5 1538e25c). Kernel log after the reload: only
 "GC2607 probe successful" and the format line per probe. A 5 s ffmpeg read: 126 frames; 0 "Failed to read/write reg"
 lines; the camera node in PipeWire survived the driver reload. Still owed [OWNER]: one suspend/resume, then a stream.
+
+## C1 Dead weight (2026-10-18)
+
+Removed: `hal-config/` (HAL tuning and sensor config, dead per `docs/native_hal_investigation.md`; both HAL docs now say
+how to restore it from git history), `ipu-bridge-oot/7.0.12/` (a June hand build for a kernel no longer booted; DKMS's
+`ipu-bridge-gc2607` replaces it; no link or config on the laptop points into it), the disabled local tone mapping
+(204 lines of `gc2607_isp.c`), the stale "zero CPU" comment, and the untested Python fallback (`gc2607_virtualcam.py`,
+the service's fallback branch, the setup's Python search and `.python-path`; the setup's `scripts` step deletes the
+copies in /opt). The full setup now refuses to run unless the ISP is built, instead of compiling it as root inside the
+synced tree. `__pycache__/` is ignored. The "centre-weighted" comment had already gone with Q1.
+
+Why the tone mapping stayed off, from its removed comment: with the knee at Y 120 or 200 alike, skin crossing the
+knee moved the coarse grid's factor boundary and showed as patches that followed the face; a hard threshold on a
+coarse grid cannot avoid that on textured skin.
+
+`make isp` and `make modules`: no warnings (pahole/BTF notes only). `make test`: 3 ok. `make bench`: 10.44 ms cpu 0,
+20.65 ms cpu 12 (unchanged). Deployed (`scripts` + `gc2607-install-isp.sh`, `OK`): the service starts, the camera is
+listed and reads 30 frames.
+
+Left for the owner: the two May copies of the service script in /opt/gc2607 (`gc2607-service.sh.bak-modload`,
+`.pre-libcamera-bridge.bak`; `gc2607_isp.bak` is the ISP installer's rollback copy, rewritten on each install);
+`gc2607-finalize.sh`, a June 7.0.12 migration script that pointed at `ipu-bridge-oot/` (a power script, outside this
+work); and ~39 early experiment files in the repo root (`test_*.sh`, `view_raw*.py`, `QUICK_TEST.sh`,
+`start_camera_service.sh`, `reload_for_chrome.sh`, ...), outside the handover's list.

@@ -23,8 +23,9 @@ install_unit() {
 # from the next service start (the ISP binary has its own installer, gc2607-install-isp.sh).
 install_scripts() {
     mkdir -p "$INSTALL_DIR"
-    install -m 0755 "${SCRIPT_DIR}/gc2607_virtualcam.py" "${SCRIPT_DIR}/gc2607-service.sh" "${SCRIPT_DIR}/gc2607-media.sh" \
+    install -m 0755 "${SCRIPT_DIR}/gc2607-service.sh" "${SCRIPT_DIR}/gc2607-media.sh" \
         "${SCRIPT_DIR}/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
+    rm -f "$INSTALL_DIR/gc2607_virtualcam.py" "$INSTALL_DIR/.python-path"   # retired Python fallback
     sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" "$INSTALL_DIR/gc2607-service.sh"
 }
 
@@ -50,22 +51,9 @@ esac
 USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 USER_HOME=$(getent passwd "$USER" | cut -d: -f6)
 
-# Find python3 with required packages (used as fallback if C ISP not available)
-find_python() {
-    for p in /usr/bin/python3 /usr/local/bin/python3; do
-        if "$p" -c "import numpy, pyfakewebcam" 2>/dev/null; then
-            echo "$p"; return
-        fi
-    done
-    for p in "${USER_HOME}/miniconda3/bin/python3" "${USER_HOME}/.conda/bin/python3" "${USER_HOME}/.local/bin/python3"; do
-        if [ -x "$p" ] && "$p" -c "import numpy, pyfakewebcam" 2>/dev/null; then
-            echo "$p"; return
-        fi
-    done
-    echo "python3"
-}
-PYTHON="$(find_python)"
 echo "User: ${USER}"
+# Built as the user, not here: a root-owned build in the synced tree breaks Syncthing on other machines.
+[ -x "${SCRIPT_DIR}/gc2607_isp" ] || { echo "Build the ISP first, as yourself: make isp" >&2; exit 1; }
 
 echo "=== Installing GC2607 Camera Service ==="
 
@@ -73,27 +61,13 @@ echo "=== Installing GC2607 Camera Service ==="
 echo "Stopping any running instances..."
 systemctl stop gc2607-camera.service 2>/dev/null || true
 kill $(pgrep -f gc2607_isp) 2>/dev/null || true
-kill $(pgrep -f gc2607_virtualcam) 2>/dev/null || true
 sleep 1
 
-# Build the C ISP if not already built
-if [ ! -f "${SCRIPT_DIR}/gc2607_isp" ]; then
-    echo "Building gc2607_isp..."
-    if command -v gcc &>/dev/null; then
-        gcc -O2 -Wall -march=native -o "${SCRIPT_DIR}/gc2607_isp" "${SCRIPT_DIR}/gc2607_isp.c" -lm
-    else
-        echo "Warning: gcc not found, will use Python virtualcam fallback"
-    fi
-fi
 
 # Copy scripts and binary to /opt where systemd can access them
 echo "Installing to ${INSTALL_DIR}..."
 install_scripts
-[ -f "${SCRIPT_DIR}/gc2607_isp" ] && install -m 0755 "${SCRIPT_DIR}/gc2607_isp" "$INSTALL_DIR/"
-
-# Save the detected Python path so the service can find it at boot
-echo "$PYTHON" > "$INSTALL_DIR/.python-path"
-echo "Saved Python path: ${PYTHON}"
+install -m 0755 "${SCRIPT_DIR}/gc2607_isp" "$INSTALL_DIR/"
 
 # Install wireplumber config to hide raw IPU6 nodes
 echo "Installing wireplumber config..."

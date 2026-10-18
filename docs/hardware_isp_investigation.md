@@ -9,8 +9,10 @@ gap. The software ISP remains the working solution.
 
 ## What We Have (Ready to Use)
 
-All Intel proprietary calibration files were extracted from Windows and are stored
-in `hal-config/tuning/`:
+All Intel proprietary calibration files were extracted from Windows and were stored
+in `hal-config/tuning/`. **`hal-config/` was removed from the working tree on 2026-10-18** (dead per
+`docs/native_hal_investigation.md`); to get it back: `git checkout "$(git log --diff-filter=D -n1
+--format=%h -- hal-config)^" -- hal-config`.
 
 | File | Purpose |
 |------|---------|
@@ -18,8 +20,8 @@ in `hal-config/tuning/`:
 | `graph_settings_gc2607_gc2607_MTL.xml` (194K) | PSYS firmware pipeline graph definition |
 | `gc2607_gc2607_MTL.cpf` (120B) | Additional calibration profile |
 
-Sensor config for the HAL is in `hal-config/gc2607-uf.xml`.
-Install script: `hal-config/install.sh`.
+Sensor config for the HAL was in `hal-config/gc2607-uf.xml`.
+Install script: `hal-config/install.sh` (both removed; see above).
 
 **Windows source path:** `C:\Windows\System32\DriverStore\FileRepository\gc2607.inf_amd64_5924907c31b80ed6\`
 

@@ -47,7 +47,7 @@ If any of these change materially, reopen this investigation.
 |------|----------|
 | `docs/hardware_isp_investigation.md` | April investigation; first attempt at the HW ISP path |
 | `docs/incidents/2026-05-fedora-44-regressions.md` | F44 upgrade context |
-| `hal-config/gc2607-uf.xml` | April-era HAL config including the BE SOC pipeline; preserved as evidence of what *would* be needed if the kernel side ever exists |
+| `hal-config/gc2607-uf.xml` | April-era HAL config including the BE SOC pipeline; evidence of what *would* be needed if the kernel side ever exists. Removed from the tree 2026-10-18, kept in git history (recovery: `docs/hardware_isp_investigation.md`) |
 | `/usr/share/defaults/etc/camera/ipu6epmtl/sensors/gc2607-uf.xml` | F44-shipped truncated version (BE SOC pipeline removed) |
 
 ## Sources for this conclusion

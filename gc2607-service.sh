@@ -2,7 +2,7 @@
 #
 # GC2607 Camera Service Script
 # Called by systemd gc2607-camera.service at boot.
-# Sets up the pipeline and v4l2loopback, then runs the ISP (or the Python fallback).
+# Sets up the pipeline and v4l2loopback, then runs the ISP.
 #
 
 set -euo pipefail
@@ -41,18 +41,7 @@ if [ "$(cat /sys/class/video4linux/video50/name 2>/dev/null)" != "GC2607 Camera"
 fi
 log "v4l2loopback ready on /dev/video50"
 
-# ── Start C ISP (or fallback to Python virtualcam) ─────────────────
+# ── Start the ISP ───────────────────────────────────────────────────
 
 log "Starting ISP (capture=$CAPTURE_DEV output=/dev/video50)..."
-if [ -x "${SCRIPT_DIR}/gc2607_isp" ]; then
-    exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" /dev/video50
-else
-    # Fallback to Python virtualcam
-    log "gc2607_isp not found, falling back to Python virtualcam"
-    if [ -f "${SCRIPT_DIR}/.python-path" ]; then
-        PYTHON="$(cat "${SCRIPT_DIR}/.python-path")"
-    else
-        PYTHON="python3"
-    fi
-    exec "$PYTHON" "${SCRIPT_DIR}/gc2607_virtualcam.py" "$CAPTURE_DEV" /dev/video50
-fi
+exec "${SCRIPT_DIR}/gc2607_isp" "$CAPTURE_DEV" /dev/video50
