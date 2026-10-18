@@ -1,4 +1,5 @@
-/* Display curve (handover Q2): black, white, mid-grey and shadow levels, and monotonicity. */
+/* Display curve (handover Q2): black, white, mid-grey and shadow levels, monotonicity; and saturated
+ * raw renders white under any white balance (Q5). */
 #define main isp_main
 #include "../gc2607_isp.c"
 #undef main
@@ -20,5 +21,17 @@ int main(void)
         CHECK(lut_g[i] >= lut_g[i - 1], "LUT decreases at %d: %d -> %d", i, lut_g[i - 1], lut_g[i]);
     for (int i = 0; i < LUT_SIZE; i++)
         CHECK(lut_r[i] == lut_g[i] && lut_b[i] == lut_g[i], "unit gains differ by channel at %d", i);
+
+    /* Saturated raw stays white whatever the white balance (Q5): gains are normalised so none is
+     * below 1, and the controller never sets digital gain below 1. */
+    const float rel[][2] = { { 2.2f, 1.65f }, { 0.9f, 1.4f } };
+    for (int k = 0; k < 2; k++) {
+        float wb[3];
+        wb_gains(rel[k][0], rel[k][1], wb);
+        build_luts(wb[0], wb[1], wb[2], 1.0f);
+        int r = lut_r[LUT_SIZE - 1], g = lut_g[LUT_SIZE - 1], b = lut_b[LUT_SIZE - 1];
+        CHECK(r == 255 && g == 255 && b == 255, "R/G %.2f B/G %.2f: saturated renders (%d, %d, %d)",
+              rel[k][0], rel[k][1], r, g, b);
+    }
     return check_report("test_lut");
 }

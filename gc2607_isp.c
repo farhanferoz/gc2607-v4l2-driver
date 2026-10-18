@@ -2,10 +2,10 @@
  * gc2607_isp.c — Lightweight userspace ISP for GC2607 camera sensor
  *
  * Captures raw 10-bit Bayer GRBG from V4L2, applies:
- *   - 2x2 Bayer binning (demosaic to half resolution)
+ *   - Bilinear demosaic to 1920x1080 (2x2 binning to 960x540 with GC2607_ISP_HALF_RES=1)
  *   - Black level subtraction
  *   - Gray-world auto white balance
- *   - Auto-exposure (software + hardware)
+ *   - Auto-exposure: one controller over exposure, analogue gain, frame length and digital gain
  *   - sRGB encoding + mild contrast via per-channel LUT
  *   - 180° rotation
  * Outputs YUYV to v4l2loopback.
@@ -55,37 +55,45 @@
 #define WB_SUBSAMPLE    8       /* Sample every Nth pixel for WB stats */
 
 /*
- * Auto exposure — multi-zone AE with shadow-priority metering, plus
- * percentile highlight cap. Models what hardware ISPs (Intel IPU6, RPi
- * IPA) do: divide the frame into a grid, compute per-zone luma, and pick
- * an exposure target that exposes the *darker* regions. This handles
- * backlit subjects correctly regardless of where the subject is in the
- * frame — centre weighting fails when the subject isn't centred or the
- * centre contains the bright background (e.g. window).
+ * Exposure control (camera-fix handover Q1): one controller owns the total exposure
+ * T = exposure lines x analogue gain x digital gain d, meters every frame, and spreads T over
+ * the sensor in a fixed order (see ae_allocate()). Until 2026-10-18 a software brightness loop
+ * and a separate hardware loop fought each other, and exposure was never lowered in 60 days.
  *
- *  1. Mean target: AE_TARGET applied to the mean of the AE_DARK_FRACTION
- *     darkest zones. Backlit face gets exposed; bright window/wall doesn't
- *     drag exposure down.
- *  2. Highlight cap: the AE_HIGHLIGHT_PCTILE percentile of green must stay
- *     at or below AE_HIGHLIGHT_CAP — this is now the *only* line of
- *     defence against wall blowout (LTM is permanently disabled — see
- *     main loop) so the cap is held tight.
+ * Metering: the display mean luma Y aims at AE_TARGET_Y; the linear 98th percentile of green
+ * may not pass AE_CAP_P98 (or the total drops by AE_CAP_CLIPPED while >= AE_CLIP_FRACTION of
+ * samples sit in the top raw bin); but Y never goes below AE_FLOOR_Y, so a backlit subject
+ * stays visible and the window clips instead.
  */
-#define AE_TARGET           100.0f  /* mean (0-255) for the dark-zones target */
-#define AE_HIGHLIGHT_PCTILE 0.98f
-#define AE_HIGHLIGHT_CAP    220.0f  /* 98th-pctile green ceiling — sole defence against wall blowout */
-#define AE_SMOOTHING        0.92f
-#define AE_INTERVAL_S       1.5
-#define BRIGHTNESS_MIN      0.5f
-#define BRIGHTNESS_MAX      3.5f
+#define AE_TARGET_Y         0.45f
+#define AE_FLOOR_Y          0.30f
+#define AE_CAP_P98          0.92f
+#define AE_CAP_CLIPPED      0.80f
+#define AE_CLIP_FRACTION    0.02f
+#define AE_PCTILE           0.98f
+#define AE_STEP_MIN         0.5f    /* largest single correction, down and up */
+#define AE_STEP_MAX         2.0f
+#define AE_DEADBAND_LOG2    0.05f   /* ignore corrections under ~3.5% */
+#define AE_DAMPING          0.3f    /* share of each correction applied per update */
+/* Per-update linear step. Display luma moves up to ~1.15x as fast in the deep shadows (the
+ * contrast term), so 1.10 keeps any one frame within 12%. */
+#define AE_UPDATE_MAX       1.10f
+#define AE_FAST_FRAMES      10      /* undamped corrections at the start of a session */
+#define AE_LATENCY_FRAMES   1       /* frames still taken with the old controls after a write (T0.4) */
+#define AE_GAMMA            2.2f    /* display-to-linear exponent for metering */
 
-/* Multi-zone AE grid over the output frame. */
-#define AE_ZONES_X          16
-#define AE_ZONES_Y          16
-#define AE_ZONES            (AE_ZONES_X * AE_ZONES_Y)
-#define AE_DARK_FRACTION    0.25f   /* expose for the darkest 25% of zones */
+/* Sensor timing from the driver (D1): 29.97 us per line, frame length 1116..2232 lines. */
+#define LINE_US             29.97f
+#define FLL_MIN             1116
+#define FLL_MAX             2232
+#define EXPOSURE_MARGIN     8       /* exposure stays this far below the frame length */
+#define EXPOSURE_30FPS      1002    /* 30 ms, the longest exposure at full frame rate */
+#define EXPOSURE_15FPS      2004    /* 60 ms, frame length 2012 */
+#define GAIN_30FPS          8       /* 3.95x: the gain used before the frame rate drops */
+#define DIGITAL_MAX         2.0f
+#define FLICKER_HZ_DEFAULT  50      /* GC2607_ISP_FLICKER_HZ: 50, 60, or 0 = off */
 
-/* Green-channel histogram for highlight cap. */
+/* Green-channel histogram for the highlight cap. */
 #define HISTOGRAM_BINS      64
 #define HIST_BIN_WIDTH      (LUT_SIZE / HISTOGRAM_BINS)
 
@@ -125,9 +133,15 @@
 
 /* Sensor hardware limits */
 #define EXPOSURE_MIN    4
-#define EXPOSURE_MAX    2002
-#define GAIN_MIN        0
 #define GAIN_MAX        16
+
+/* Real analogue gain of each driver gain index, x64: the vendor calibration (CMC) for this
+ * register table, as decoded in AlexDaichendt/gc2607-camera-linux FINDINGS.md "Gain model". */
+static const uint16_t gain_x64[GAIN_MAX + 1] = {
+    64, 76, 93, 111, 130, 156, 184, 221, 253, 304, 367, 434, 510, 607, 717, 847, 1012,
+};
+
+static inline float gain_of(int index) { return gain_x64[index] / 64.0f; }
 
 /* V4L2 capture buffers */
 #define NUM_BUFFERS     4
@@ -188,6 +202,11 @@ static int xioctl(int fd, unsigned long request, void *arg)
     return r;
 }
 
+static double seconds_between(const struct timespec *a, const struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) + (b->tv_nsec - a->tv_nsec) / 1e9;
+}
+
 /* sRGB encoding (IEC 61966-2-1) of a linear value in [0, 1]. */
 static inline float srgb_encode(float v)
 {
@@ -196,21 +215,21 @@ static inline float srgb_encode(float v)
 
 /*
  * Build per-channel LUTs that encode the per-pixel pipeline:
- *   black_level_subtract -> WB_gain -> brightness -> sRGB encoding -> mild contrast
+ *   black_level_subtract -> WB_gain -> digital gain -> sRGB encoding -> mild contrast
  *
  * The contrast mixes LUT_CONTRAST of a smoothstep into the ENCODED value. Until 2026-10-18
  * the smoothstep ran on linear values before a 1/2.2 gamma, which rendered 18% grey at
  * 83/255 instead of ~117 and crushed the shadows (handover Q2).
  *
- * Called once per frame with updated WB gains and brightness.
+ * Called once per frame with updated WB gains and digital gain.
  */
-static void build_luts(float r_gain, float g_gain, float b_gain, float brightness)
+static void build_luts(float r_gain, float g_gain, float b_gain, float digital)
 {
     const float gains[3] = { r_gain, g_gain, b_gain };
     uint8_t *luts[3] = { lut_r, lut_g, lut_b };
 
     for (int c = 0; c < 3; c++) {
-        float scale = gains[c] * brightness / MAX_SIGNAL;
+        float scale = gains[c] * digital / MAX_SIGNAL;
         for (int i = 0; i < LUT_SIZE; i++) {
             float v = fminf(fmaxf((float)(i - BLACK_LEVEL) * scale, 0.0f), 1.0f);
             float e = srgb_encode(v);
@@ -343,33 +362,30 @@ static inline void rgb_to_yuyv(uint8_t r0, uint8_t g0, uint8_t b0,
     out[3] = (uint8_t)(v  < 16 ? 16 : (v  > 240 ? 240 : v));
 }
 
-/*
- * Per-frame multi-zone AE accumulators. Populated by collect_stats();
- * consumed by compute_ae_zone_target() in the main loop.
- */
-static uint64_t ae_zone_g_sum[AE_ZONES];
-static uint32_t ae_zone_g_count[AE_ZONES];
+/* Per-frame statistics for white balance and exposure, filled by collect_stats(). */
+struct frame_stats {
+    float r_mean, g_mean, b_mean;    /* raw above black, over unsaturated samples */
+    int count;                        /* samples in those means */
+    float y_mean;                     /* display luma of every sample after the LUTs, 0..1 */
+    uint32_t g_hist[HISTOGRAM_BINS];  /* raw green of every sample, saturated included */
+    int hist_total;
+};
 
 /*
- * White-balance and exposure statistics from every WB_SUBSAMPLE-th 2x2 Bayer block in each
- * direction: the half-resolution sampling the controllers were tuned on, whatever the output
- * size. Zones are in rotated half-resolution coordinates, as when this ran inside the binning loop.
+ * Statistics from every WB_SUBSAMPLE-th 2x2 Bayer block in each direction (the half-resolution
+ * sampling, whatever the output size). Needs this frame's LUTs for the display luma.
  */
-static void collect_stats(const uint16_t *bayer, float *out_r_sum, float *out_g_sum,
-                          float *out_b_sum, uint32_t *out_g_hist, int *out_hist_total,
-                          int *out_count)
+static void collect_stats(const uint16_t *bayer, struct frame_stats *st)
 {
     double r_sum = 0, g_sum = 0, b_sum = 0;
+    uint64_t y_sum = 0;
     int stat_count = 0;
     int hist_total = 0;
-    memset(out_g_hist, 0, HISTOGRAM_BINS * sizeof(*out_g_hist));
-    memset(ae_zone_g_sum, 0, sizeof(ae_zone_g_sum));
-    memset(ae_zone_g_count, 0, sizeof(ae_zone_g_count));
+    memset(st->g_hist, 0, sizeof(st->g_hist));
 
     for (int oy = 0; oy < HALF_H; oy += WB_SUBSAMPLE) {
         const uint16_t *row0 = bayer + (oy * 2) * SENSOR_W;
         const uint16_t *row1 = row0 + SENSOR_W;
-        int out_y = HALF_H - 1 - oy;
 
         for (int ox = 0; ox < HALF_W; ox += WB_SUBSAMPLE) {
             int r = row0[ox * 2 + 1], b = row1[ox * 2];
@@ -378,12 +394,11 @@ static void collect_stats(const uint16_t *bayer, float *out_r_sum, float *out_g_
             if (g >= LUT_SIZE) g = LUT_SIZE - 1;
             if (b >= LUT_SIZE) b = LUT_SIZE - 1;
 
-            /* Histogram: every sampled pixel including saturated ones —
+            /* Histogram and display luma: every sampled pixel including saturated ones —
              * the highlight cap explicitly needs to see clipped values. */
-            int hbin = g / HIST_BIN_WIDTH;
-            if (hbin >= HISTOGRAM_BINS) hbin = HISTOGRAM_BINS - 1;
-            out_g_hist[hbin]++;
+            st->g_hist[g / HIST_BIN_WIDTH]++;
             hist_total++;
+            y_sum += 77 * lut_r[r] + 150 * lut_g[g] + 29 * lut_b[b];   /* BT.601 luma x256 */
 
             /* WB / mean stats: skip saturated — clipped values hide the
              * true channel ratio, causing AWB to underestimate green
@@ -396,28 +411,20 @@ static void collect_stats(const uint16_t *bayer, float *out_r_sum, float *out_g_
                 g_sum += gv;
                 b_sum += bv;
                 stat_count++;
-
-                /* Multi-zone AE: accumulate green into the right zone of a 16x16 grid. */
-                int zx = (HALF_W - 2 - ox) * AE_ZONES_X / HALF_W;
-                int zy = out_y * AE_ZONES_Y / HALF_H;
-                if (zx >= AE_ZONES_X) zx = AE_ZONES_X - 1;
-                if (zy >= AE_ZONES_Y) zy = AE_ZONES_Y - 1;
-                int zidx = zy * AE_ZONES_X + zx;
-                ae_zone_g_sum[zidx] += (uint64_t)gv;
-                ae_zone_g_count[zidx]++;
             }
         }
     }
 
     if (stat_count > 0) {
-        *out_r_sum = (float)(r_sum / stat_count);
-        *out_g_sum = (float)(g_sum / stat_count);
-        *out_b_sum = (float)(b_sum / stat_count);
+        st->r_mean = (float)(r_sum / stat_count);
+        st->g_mean = (float)(g_sum / stat_count);
+        st->b_mean = (float)(b_sum / stat_count);
     } else {
-        *out_r_sum = *out_g_sum = *out_b_sum = 0.0f;
+        st->r_mean = st->g_mean = st->b_mean = 0.0f;
     }
-    *out_count = stat_count;
-    *out_hist_total = hist_total;
+    st->count = stat_count;
+    st->hist_total = hist_total;
+    st->y_mean = hist_total ? (float)y_sum / (256.0f * 255.0f * hist_total) : 0.0f;
 }
 
 /*
@@ -545,60 +552,174 @@ static void bin_half(const uint16_t *bayer)
 }
 
 /*
- * Process one Bayer frame -> YUYV in yuyv_buf (out_w x out_h, rotated 180 degrees), and return
- * the statistics for white balance and exposure. Returns the subsampled green mean.
+ * Process one Bayer frame -> YUYV in yuyv_buf (out_w x out_h, rotated 180 degrees) with white
+ * balance wb[3] and digital gain d, and fill the statistics for white balance and exposure.
  */
-static float process_frame(const uint16_t *bayer, float r_gain, float b_gain,
-                           float brightness, float *out_r_sum, float *out_g_sum,
-                           float *out_b_sum,
-                           uint32_t *out_g_hist, int *out_hist_total,
-                           int *out_count)
+static void process_frame(const uint16_t *bayer, const float wb[3], float d, struct frame_stats *st)
 {
-    /* Green gain is always 1.0 in gray-world WB */
-    build_luts(r_gain, 1.0f, b_gain, brightness);
-    collect_stats(bayer, out_r_sum, out_g_sum, out_b_sum, out_g_hist, out_hist_total, out_count);
+    build_luts(wb[0], wb[1], wb[2], d);
+    collect_stats(bayer, st);
     if (half_res)
         bin_half(bayer);
     else
         demosaic_full(bayer);
-    return *out_g_sum;
 }
 
 /*
- * Compute the multi-zone AE target: mean green of the AE_DARK_FRACTION
- * darkest zones. Skips empty zones (sparse stat sampling can leave some).
- * This is the shadow-priority metering that gives backlit subjects the
- * right exposure regardless of where they are in the frame.
+ * Grey-world white-balance gains relative to green, divided by the smallest so that none is
+ * below 1.0. A gain below 1 keeps that channel short of 255 when the sensor saturates, which
+ * tinted clipped highlights pink (handover Q5).
  */
-static float compute_ae_zone_target(void)
+static void wb_gains(float r_rel, float b_rel, float wb[3])
 {
-    float means[AE_ZONES];
-    int n = 0;
-    for (int z = 0; z < AE_ZONES; z++) {
-        if (ae_zone_g_count[z] > 0) {
-            means[n++] = (float)ae_zone_g_sum[z] / (float)ae_zone_g_count[z];
+    float lo = fminf(fminf(r_rel, 1.0f), b_rel);
+    wb[0] = r_rel / lo;
+    wb[1] = 1.0f / lo;
+    wb[2] = b_rel / lo;
+}
+
+/* Grey-world gains relative to green from one frame, each within 0.25..4. Returns 0 when a
+ * channel is too dark to measure. */
+static int wb_from_stats(const struct frame_stats *st, float *r_rel, float *b_rel)
+{
+    if (st->r_mean <= 1.0f || st->g_mean <= 1.0f || st->b_mean <= 1.0f)
+        return 0;
+    *r_rel = fminf(fmaxf(st->g_mean / st->r_mean, 0.25f), 4.0f);
+    *b_rel = fminf(fmaxf(st->g_mean / st->b_mean, 0.25f), 4.0f);
+    return 1;
+}
+
+/* Sensor controls plus the digital gain d the LUTs apply. */
+struct ae_hw {
+    int exposure;   /* lines */
+    int gain;       /* driver gain index 0..GAIN_MAX */
+    int fll;        /* frame length, lines */
+    float d;
+};
+
+struct ae_state {
+    struct ae_hw cur;      /* last controls written; d is what the current frame is rendered with */
+    float next_d;          /* d for the first frame taken with the last write */
+    int skip;              /* frames still taken with the controls before the last write */
+    int session_frames;
+    int flicker_lines;     /* exposure quantum against mains flicker, 0 = off */
+};
+
+/* One frame's metering, kept for the status line. */
+struct ae_meter {
+    float y, p98, clipped, m;
+};
+
+static double ae_total(const struct ae_hw *h) { return h->exposure * (double)gain_of(h->gain) * h->d; }
+
+/* Lines per flicker period (lamps flicker at twice the mains frequency) from GC2607_ISP_FLICKER_HZ. */
+static int flicker_lines_from_env(void)
+{
+    const char *v = getenv("GC2607_ISP_FLICKER_HZ");
+    int hz = v ? atoi(v) : FLICKER_HZ_DEFAULT;
+    if (hz != 0 && hz != 50 && hz != 60)
+        hz = FLICKER_HZ_DEFAULT;
+    return hz ? (int)lroundf(1e6f / (2.0f * hz) / LINE_US) : 0;
+}
+
+/* Largest gain index up to `cap` with exposure x gain <= total. */
+static int gain_for(double total, int exposure, int cap)
+{
+    int g = 0;
+    while (g < cap && exposure * (double)gain_of(g + 1) <= total)
+        g++;
+    return g;
+}
+
+/*
+ * Spread a total exposure over the sensor, least noise first (and release in reverse): exposure
+ * up to 30 ms at unity gain; then analogue gain up to 3.95x; then a longer frame, down to 15 fps,
+ * with exposure up to 60 ms; then gain up to 15.8x; then digital gain up to 2x. d covers what
+ * the integer steps leave. Once the exposure spans a flicker period it is rounded down to whole
+ * periods, so mains-powered lights cannot band, and d makes up the rest.
+ */
+static struct ae_hw ae_allocate(double total, int flicker)
+{
+    total = fmin(fmax(total, EXPOSURE_MIN), EXPOSURE_15FPS * (double)gain_of(GAIN_MAX) * DIGITAL_MAX);
+    struct ae_hw h;
+    int cap;
+    if (total <= EXPOSURE_30FPS) {
+        h.exposure = (int)total;
+        cap = 0;
+    } else if (total <= EXPOSURE_30FPS * (double)gain_of(GAIN_30FPS)) {
+        h.exposure = EXPOSURE_30FPS;
+        cap = GAIN_30FPS;
+    } else if (total <= EXPOSURE_15FPS * (double)gain_of(GAIN_30FPS)) {
+        h.exposure = (int)(total / gain_of(GAIN_30FPS));
+        cap = GAIN_30FPS;
+    } else {
+        h.exposure = EXPOSURE_15FPS;
+        cap = GAIN_MAX;
+    }
+    if (flicker && h.exposure >= flicker)
+        h.exposure -= h.exposure % flicker;
+    h.gain = gain_for(total, h.exposure, cap);
+    h.d = (float)fmin(fmax(total / (h.exposure * (double)gain_of(h.gain)), 1.0), DIGITAL_MAX);
+    h.fll = h.exposure + EXPOSURE_MARGIN > FLL_MIN ? h.exposure + EXPOSURE_MARGIN : FLL_MIN;
+    return h;
+}
+
+/*
+ * Meter one frame rendered with green white-balance gain wb_g and digital gain d. Returns the
+ * factor to move the total exposure by: 1.0 inside the deadband, the full correction while
+ * `fast` (a session's first frames), otherwise a damped share of it.
+ */
+static float ae_meter_frame(const struct frame_stats *st, float wb_g, float d, int fast, struct ae_meter *mt)
+{
+    int threshold = (int)(st->hist_total * AE_PCTILE), cum = 0, bin = HISTOGRAM_BINS - 1;
+    for (int b = 0; b < HISTOGRAM_BINS; b++) {
+        cum += st->g_hist[b];
+        if (cum >= threshold) {
+            bin = b;
+            break;
         }
     }
-    if (n == 0) return 0;
+    mt->p98 = fmaxf(((bin + 0.5f) * HIST_BIN_WIDTH - BLACK_LEVEL) / MAX_SIGNAL, 0.001f) * wb_g * d;
+    mt->clipped = st->hist_total ? (float)st->g_hist[HISTOGRAM_BINS - 1] / st->hist_total : 0.0f;
+    mt->y = st->y_mean;
 
-    int m = (int)(n * AE_DARK_FRACTION);
-    if (m < 1) m = 1;
+    float y = fmaxf(mt->y, 0.001f);
+    float m = fminf(powf(AE_TARGET_Y / y, AE_GAMMA),
+                    mt->clipped >= AE_CLIP_FRACTION ? AE_CAP_CLIPPED : AE_CAP_P98 / mt->p98);
+    if (y * powf(m, 1.0f / AE_GAMMA) < AE_FLOOR_Y)   /* backlight: keep the subject visible */
+        m = powf(AE_FLOOR_Y / y, AE_GAMMA);
+    m = fminf(fmaxf(m, AE_STEP_MIN), AE_STEP_MAX);
+    mt->m = m;
+    if (fabsf(log2f(m)) < AE_DEADBAND_LOG2)
+        return 1.0f;
+    return fast ? m : fminf(fmaxf(powf(m, AE_DAMPING), 1.0f / AE_UPDATE_MAX), AE_UPDATE_MAX);
+}
 
-    /* Partial selection sort: bring the m smallest to the front of the
-     * array, then average them. O(m*n) — for n=256, m=64, ~16k compares
-     * per frame which is negligible. */
-    for (int i = 0; i < m; i++) {
-        int min_idx = i;
-        for (int j = i + 1; j < n; j++) {
-            if (means[j] < means[min_idx]) min_idx = j;
-        }
-        if (min_idx != i) {
-            float t = means[i]; means[i] = means[min_idx]; means[min_idx] = t;
-        }
+/*
+ * Advance the controller by one processed frame. Returns 1 when `*write` holds new sensor
+ * controls to apply now. The next AE_LATENCY_FRAMES frames were already taken with the old
+ * controls: they keep the old d and are not metered, and d switches with the first new frame.
+ */
+static int ae_step(struct ae_state *s, float factor, struct ae_hw *write)
+{
+    if (s->skip > 0) {
+        if (--s->skip == 0)
+            s->cur.d = s->next_d;
+        return 0;
     }
-    float sum = 0;
-    for (int i = 0; i < m; i++) sum += means[i];
-    return sum / (float)m;
+    if (factor == 1.0f)
+        return 0;
+    struct ae_hw h = ae_allocate(ae_total(&s->cur) * factor, s->flicker_lines);
+    if (h.exposure == s->cur.exposure && h.gain == s->cur.gain && h.fll == s->cur.fll) {
+        s->cur.d = h.d;   /* software only: takes effect on the next frame */
+        return 0;
+    }
+    s->next_d = h.d;
+    h.d = s->cur.d;
+    *write = h;
+    s->cur = h;
+    s->skip = AE_LATENCY_FRAMES;
+    return 1;
 }
 
 /*
@@ -778,21 +899,27 @@ static int find_sensor_subdev(char *path, size_t pathlen)
     return -1;
 }
 
-static void set_sensor_controls(const char *subdev_path, int exposure, int gain)
+/*
+ * Write sensor controls so the exposure never exceeds the frame: a longer frame (VBLANK) is
+ * written before the exposure, a shorter one after it. Returns the number of failed writes.
+ */
+static int set_sensor_controls(int fd, const struct ae_hw *h, int longer_frame)
 {
-    int fd = open(subdev_path, O_RDWR);
-    if (fd < 0) return;
-
-    struct v4l2_control ctrl;
-    ctrl.id = V4L2_CID_EXPOSURE;
-    ctrl.value = exposure;
-    xioctl(fd, VIDIOC_S_CTRL, &ctrl);
-
-    ctrl.id = V4L2_CID_ANALOGUE_GAIN;
-    ctrl.value = gain;
-    xioctl(fd, VIDIOC_S_CTRL, &ctrl);
-
-    close(fd);
+    struct v4l2_control vblank = { .id = V4L2_CID_VBLANK, .value = h->fll - SENSOR_H };
+    struct v4l2_control ctrls[3] = {
+        { .id = V4L2_CID_EXPOSURE, .value = h->exposure },
+        { .id = V4L2_CID_ANALOGUE_GAIN, .value = h->gain },
+        vblank,
+    };
+    if (longer_frame) {
+        ctrls[2] = ctrls[1];
+        ctrls[1] = ctrls[0];
+        ctrls[0] = vblank;
+    }
+    int failed = 0;
+    for (int i = 0; i < 3; i++)
+        failed += xioctl(fd, VIDIOC_S_CTRL, &ctrls[i]) < 0;
+    return failed;
 }
 
 /*
@@ -1127,33 +1254,40 @@ static int streaming_loop(const char *capture_dev, int out_fd,
     int n_buffers = 0;
 
     /*
-     * ISP state is static so it persists across streaming sessions.
-     * Without this, each session resets exposure/gain/WB to defaults,
-     * causing overexposed frames until hardware AE reconverges (~15s).
+     * Exposure and white-balance state persist across streaming sessions, so a new session
+     * starts from the last exposure instead of reconverging. First start: 30 ms, unity gain.
      */
-    static int cur_exposure = 600;
-    static int cur_gain = 4;
-    static float wb_r_gain = 1.0f;
-    static float wb_b_gain = 1.0f;
-    static float brightness = 1.0f;
+    static struct ae_state ae = {
+        .cur = { .exposure = EXPOSURE_30FPS, .gain = 0, .fll = FLL_MIN, .d = 1.0f },
+    };
+    static float wb_r_rel = 1.0f, wb_b_rel = 1.0f;   /* grey-world gains relative to green */
+    if (ae.skip) {   /* the last session ended inside a write's latency: its controls stand */
+        ae.cur.d = ae.next_d;
+        ae.skip = 0;
+    }
+    ae.session_frames = 0;
+    ae.flicker_lines = flicker_lines_from_env();
 
-    /* Restore hardware exposure/gain from previous session */
-    if (has_subdev)
-        set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+    /* Restore the controls; the sensor is off, so writing the frame length first always fits. */
+    int sub_fd = has_subdev ? open(subdev_path, O_RDWR) : -1;
+    int ctrl_failures = sub_fd >= 0 ? set_sensor_controls(sub_fd, &ae.cur, 1) : 0;
 
     int cap_fd = open_capture(capture_dev, buffers, &n_buffers);
-    if (cap_fd < 0)
+    if (cap_fd < 0) {
+        if (sub_fd >= 0)
+            close(sub_fd);
         return -1;
+    }
 
-    printf("[gc2607_isp] Streaming started (output %dx%d YUYV, exp=%d gain=%d bright=%.2f)\n",
-           out_w, out_h, cur_exposure, cur_gain, brightness);
+    printf("[gc2607_isp] Streaming started (output %dx%d YUYV, exp=%d gain=%d fll=%d d=%.2f, flicker %d lines)\n",
+           out_w, out_h, ae.cur.exposure, ae.cur.gain, ae.cur.fll, ae.cur.d, ae.flicker_lines);
 
     int frame_count = 0;
     int no_consumer_count = 0;
 
-    struct timespec last_ae_time, last_consumer_check;
-    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
+    struct timespec now, last_consumer_check, last_status;
     clock_gettime(CLOCK_MONOTONIC, &last_consumer_check);
+    last_status = last_consumer_check;
 
     int stalled_s = 0;
     while (running) {
@@ -1187,16 +1321,10 @@ static int streaming_loop(const char *capture_dev, int out_fd,
 
         const uint16_t *bayer = (const uint16_t *)buffers[buf.index].start;
 
-        /* Process frame */
-        float r_mean, g_mean, b_mean;
-        uint32_t g_hist[HISTOGRAM_BINS];
-        int stat_count, hist_total;
-        process_frame(bayer, wb_r_gain, wb_b_gain, brightness,
-                      &r_mean, &g_mean, &b_mean,
-                      g_hist, &hist_total, &stat_count);
-
-        /* Multi-zone AE target: mean green of the darkest 25% of zones. */
-        float g_target = compute_ae_zone_target();
+        float wb[3];
+        wb_gains(wb_r_rel, wb_b_rel, wb);
+        struct frame_stats st;
+        process_frame(bayer, wb, ae.cur.d, &st);
 
         /* LTM permanently disabled. Both KNEE=120 (Y-threshold inside
          * skin midtones) and KNEE=200 (only true highlights) produce
@@ -1209,91 +1337,22 @@ static int streaming_loop(const char *capture_dev, int out_fd,
          * a textured signal" — no knee value escapes it on face skin. */
         (void)apply_ltm;
 
-        /* Update white balance (gray-world, no offsets) */
-        if (r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
-            float new_r_gain = g_mean / r_mean;
-            float new_b_gain = g_mean / b_mean;
-
-            /* Clamp gains to reasonable range */
-            if (new_r_gain > 4.0f) new_r_gain = 4.0f;
-            if (new_r_gain < 0.25f) new_r_gain = 0.25f;
-            if (new_b_gain > 4.0f) new_b_gain = 4.0f;
-            if (new_b_gain < 0.25f) new_b_gain = 0.25f;
-
-            /* First few frames: no smoothing for fast convergence */
+        /* White balance: grey world, unsmoothed for a session's first frames */
+        float r_rel, b_rel;
+        if (wb_from_stats(&st, &r_rel, &b_rel)) {
             float sm = frame_count < 10 ? 0.0f : WB_SMOOTHING;
-            wb_r_gain = sm * wb_r_gain + (1.0f - sm) * new_r_gain;
-            wb_b_gain = sm * wb_b_gain + (1.0f - sm) * new_b_gain;
+            wb_r_rel = sm * wb_r_rel + (1.0f - sm) * r_rel;
+            wb_b_rel = sm * wb_b_rel + (1.0f - sm) * b_rel;
         }
 
-        /*
-         * Auto-exposure: dual-constraint AGC.
-         *  (a) Mean target (centre-weighted) keeps the subject around AE_TARGET.
-         *  (b) Highlight cap keeps the AE_HIGHLIGHT_PCTILE percentile of green
-         *      below AE_HIGHLIGHT_CAP — protects bright walls/ceilings from
-         *      saturating, which a mean-only AE cannot detect.
-         * Take the more restrictive (smaller) brightness; smooth temporally.
-         */
-        float target_brightness = brightness;
-
-        /* (a) Mean target on the dark-zones average (shadow-priority). */
-        float cur_target_8bit = g_target * brightness / MAX_SIGNAL * 255.0f;
-        float bright_for_mean = (cur_target_8bit > 1.0f)
-            ? brightness * AE_TARGET / cur_target_8bit
-            : BRIGHTNESS_MAX;
-
-        /* (b) Highlight cap from green histogram */
-        float bright_for_cap = BRIGHTNESS_MAX;
-        if (hist_total > 0) {
-            int threshold = (int)(hist_total * AE_HIGHLIGHT_PCTILE);
-            int cum = 0;
-            int p_bin = HISTOGRAM_BINS - 1;
-            for (int b = 0; b < HISTOGRAM_BINS; b++) {
-                cum += g_hist[b];
-                if (cum >= threshold) { p_bin = b; break; }
-            }
-            /* Centre of bin in raw 10-bit space */
-            float pctile_raw = (p_bin + 0.5f) * (float)HIST_BIN_WIDTH - BLACK_LEVEL;
-            if (pctile_raw < 1.0f) pctile_raw = 1.0f;
-            bright_for_cap = AE_HIGHLIGHT_CAP * MAX_SIGNAL / (pctile_raw * 255.0f);
-        }
-
-        target_brightness = bright_for_mean < bright_for_cap ? bright_for_mean : bright_for_cap;
-
-        brightness = AE_SMOOTHING * brightness + (1.0f - AE_SMOOTHING) * target_brightness;
-        if (brightness < BRIGHTNESS_MIN) brightness = BRIGHTNESS_MIN;
-        if (brightness > BRIGHTNESS_MAX) brightness = BRIGHTNESS_MAX;
-
-        /* Hardware AE: adjust sensor exposure/gain when software gain is railing */
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (
-            (now.tv_sec - last_ae_time.tv_sec)
-            + (now.tv_nsec - last_ae_time.tv_nsec) / 1e9
-        );
-
-        if (has_subdev && elapsed >= AE_INTERVAL_S) {
-            if (brightness > 2.5f) {
-                if (cur_exposure < EXPOSURE_MAX) {
-                    cur_exposure = (int)(cur_exposure * 1.5);
-                    if (cur_exposure > EXPOSURE_MAX) cur_exposure = EXPOSURE_MAX;
-                } else if (cur_gain < GAIN_MAX) {
-                    /* Exposure maxed: step gain up by 2 for faster convergence */
-                    cur_gain += 2;
-                    if (cur_gain > GAIN_MAX) cur_gain = GAIN_MAX;
-                }
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                brightness = 1.0f;
-            } else if (brightness < 0.8f && (cur_exposure > EXPOSURE_MIN || cur_gain > GAIN_MIN)) {
-                cur_exposure = (int)(cur_exposure * 0.7);
-                if (cur_exposure < EXPOSURE_MIN) cur_exposure = EXPOSURE_MIN;
-                if (cur_exposure == EXPOSURE_MIN && cur_gain > GAIN_MIN)
-                    cur_gain = cur_gain - 1 >= GAIN_MIN ? cur_gain - 1 : GAIN_MIN;
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                brightness = 1.0f;
-            }
-            last_ae_time = now;
-        }
+        /* Exposure: meter, then move the total and write the sensor when its share changes */
+        struct ae_meter mt;
+        float factor = ae_meter_frame(&st, wb[1], ae.cur.d, ae.session_frames < AE_FAST_FRAMES, &mt);
+        ae.session_frames++;
+        struct ae_hw next;
+        int old_fll = ae.cur.fll;
+        if (ae_step(&ae, factor, &next) && sub_fd >= 0)
+            ctrl_failures += set_sensor_controls(sub_fd, &next, next.fll > old_fll);
 
         /* Write YUYV to v4l2loopback */
         ssize_t written = write(out_fd, yuyv_buf, out_bytes());
@@ -1308,12 +1367,15 @@ static int streaming_loop(const char *capture_dev, int out_fd,
             break;
         }
 
+        clock_gettime(CLOCK_MONOTONIC, &now);
         frame_count++;
         if (frame_count % 150 == 0) {
-            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d | means: R=%.1f G=%.1f Gdark=%.1f B=%.1f | AE: mean=>%.2f cap=>%.2f\n",
-                   frame_count, wb_r_gain, wb_b_gain, brightness, cur_exposure, cur_gain,
-                   r_mean, g_mean, g_target, b_mean,
-                   bright_for_mean, bright_for_cap);
+            printf("[gc2607_isp] %d frames | %.1f fps | WB: R=%.2f G=%.2f B=%.2f | exp=%d gain=%d fll=%d d=%.2f"
+                   " | Y=%.3f P98=%.2f clip=%.1f%% m=%.2f | ctrl_fail=%d\n",
+                   frame_count, 150 / seconds_between(&last_status, &now), wb[0], wb[1], wb[2],
+                   ae.cur.exposure, ae.cur.gain, ae.cur.fll, ae.cur.d,
+                   mt.y, mt.p98, 100.0f * mt.clipped, mt.m, ctrl_failures);
+            last_status = now;
         }
 
         /*
@@ -1321,11 +1383,7 @@ static int streaming_loop(const char *capture_dev, int out_fd,
          * If no consumers for 5 consecutive checks (~10s), stop streaming
          * to release the hardware and save power.
          */
-        double since_check = (
-            (now.tv_sec - last_consumer_check.tv_sec)
-            + (now.tv_nsec - last_consumer_check.tv_nsec) / 1e9
-        );
-        if (since_check >= CONSUMER_CHECK_INTERVAL_S) {
+        if (seconds_between(&last_consumer_check, &now) >= CONSUMER_CHECK_INTERVAL_S) {
             last_consumer_check = now;
             if (get_consumer_count(output_dev) <= 0) {
                 no_consumer_count++;
@@ -1333,6 +1391,8 @@ static int streaming_loop(const char *capture_dev, int out_fd,
                     printf("[gc2607_isp] No consumers detected, stopping stream (%d frames)\n",
                            frame_count);
                     close_capture(cap_fd, buffers, n_buffers);
+                    if (sub_fd >= 0)
+                        close(sub_fd);
                     return 0;
                 }
             } else {
@@ -1343,6 +1403,8 @@ static int streaming_loop(const char *capture_dev, int out_fd,
 
     printf("[gc2607_isp] Shutting down (%d frames total)\n", frame_count);
     close_capture(cap_fd, buffers, n_buffers);
+    if (sub_fd >= 0)
+        close(sub_fd);
     return running ? -1 : 0;
 }
 

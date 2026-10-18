@@ -173,3 +173,34 @@ DKMS for 7.2.9/7.2.10/7.2.11, `OK`; probe line `Format: SGRBG10 1920x1080@30fps`
 - Camera on, new `gc2607-raw-capture.sh --fps 36 1152` (300 frames each, nothing saved): **29.90 fps** at VBLANK 36
   and **15.16 fps** at 1152 (the timing predicts 14.95; the 1.4% gap is unexplained), exposure maximum 1108 and 2224.
   Kernel log for both windows: only stream on/off lines; no line mentioning ipu/isys/csi with err or fail this boot.
+
+## Q1 + Q5 Exposure controller, anti-flicker, neutral highlights (2026-10-18, offline part)
+
+One controller (`ae_meter_frame`, `ae_step`, `ae_allocate` in `gc2607_isp.c`) replaces the software brightness loop
+and the separate hardware loop, as specified, with these measured choices:
+- Per-update step capped at 1.10x (linear) on top of the 0.3 damping: with damping alone the simulated sensor's
+  display luma moved up to 21% in one frame while converging (the bar is 12%); the contrast term makes display luma
+  move ~1.15x as fast as linear in deep shadow, so 1.12 still gave 13.9%. Cost: a 40x light change takes ~2.5 s.
+- Real gains from the vendor table (`gain_x64`), cross-checked on today's raw: wall level at 900 lines / index 4 vs
+  1800 lines / index 0 implies 1.98x for index 4 (table: 2.03x).
+- White balance is normalised so no gain is below 1 and d never goes below 1 (Q5); P98 uses the green gain and d.
+- Flicker: `GC2607_ISP_FLICKER_HZ` (50 default, 60, 0); 334 or 278 lines per period. Status line: measured fps,
+  WB, exposure, gain, frame length, d, Y, P98, clipped %, m, failed control writes; `tools/isp_log_stats.py` reads it.
+- Statistics: `struct frame_stats` replaces the out-parameters and the 16x16 zone arrays (zones were only for the
+  removed dark-zone target); the stats pass now also returns the display luma of the sampled pixels.
+
+`make test`: test_ae, test_lut, test_output ok. `tests/test_ae.c` (simulated sensor, latency AE_LATENCY_FRAMES):
+(1) Y within 10% of 0.45 by frame 60 from E=4 and from E=2004/16x/d=2; (2) settled in light/20 with gain, then 8x
+brighter: gain 0 and exposure lower within 90 frames; (3) light/40: gain only at 30 ms, frame length only at gain
+3.95x, more gain only at 60 ms, ends at gain > 3.95x with Y on target; (4) a 2.2% window at 50x: Y >= 0.30;
+(5) after frame 12, no frame-to-frame Y step over 12%, and under 3% once settled; (6) allocation over the whole
+range at 50 Hz: product within 1%, gain 0 up to 1002 lines, exposure in whole 10 ms once >= 334 lines, frame length
+1116 unless exposure > 1108, d in [1, 2]. Mutations, each caught: no backlight floor (once the window clips),
+gain before exposure, never lowering, no damping, no flicker rounding (test_ae); no WB normalisation (test_lut).
+
+Corpus (`isp_replay` now iterates the controller's metering on a virtual digital gain until it stops asking for a
+change): every capture with signal settles at Y 0.45-0.48 (baseline 0.02-0.54); the darkest quarter rises on all
+(e.g. normal_e600_g4 0.047 -> 0.159, backlit2_e600_g4 0.019 -> 0.169); clipped <= 0.3% except the backlit and dark
+captures (<= 2.3%); raw-saturated highlights render neutral (hl_neutral 0.0). Covered-lens and dark captures show high
+chroma noise because the replay boosts them digitally without limit; live, the controller lengthens the exposure.
+`make bench`: 10.33 ms cpu 0, 20.53 ms cpu 12 (unchanged by the controller).

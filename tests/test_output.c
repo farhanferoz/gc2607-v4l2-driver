@@ -13,10 +13,9 @@ static float ref_v(float r, float g, float b) { return 128.0f + (112 * r - 94 * 
 /* Run the ISP on `bayer` with unit white balance and brightness. */
 static void run(void)
 {
-    float r, g, b;
-    uint32_t hist[HISTOGRAM_BINS];
-    int ht, sc;
-    process_frame(bayer, 1.0f, 1.0f, 1.0f, &r, &g, &b, hist, &ht, &sc);
+    const float wb[3] = { 1.0f, 1.0f, 1.0f };
+    struct frame_stats st;
+    process_frame(bayer, wb, 1.0f, &st);
 }
 
 static const uint8_t *pair_at(int y, int pair) { return yuyv_buf + ((size_t)y * out_w + pair * 2) * 2; }

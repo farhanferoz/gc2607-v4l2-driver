@@ -12,18 +12,17 @@ static uint16_t bayer[SENSOR_W * SENSOR_H];
 
 int main(void)
 {
-    float r, g, b;
-    uint32_t hist[HISTOGRAM_BINS];
-    int ht, sc;
+    const float wb[3] = { 2.0f, 1.0f, 1.6f };
+    struct frame_stats st;
     double t[ITER], a;
 
     fill_bayer(bayer, SENSOR_W * SENSOR_H);
     for (half_res = 0; half_res <= 1; half_res++) {
         for (int k = 0; k < 20; k++)
-            process_frame(bayer, 2.0f, 1.6f, 1.3f, &r, &g, &b, hist, &ht, &sc);
+            process_frame(bayer, wb, 1.3f, &st);
         for (int k = 0; k < ITER; k++) {
             a = now_ms();
-            process_frame(bayer, 2.0f, 1.6f, 1.3f, &r, &g, &b, hist, &ht, &sc);
+            process_frame(bayer, wb, 1.3f, &st);
             t[k] = now_ms() - a;
         }
         printf("process_frame (%s): %.2f ms\n", half_res ? "960x540 binned" : "1920x1080 demosaic", median_ms(t));
