@@ -283,3 +283,17 @@ first CSI2 and capture entity by name pattern; following the links names the one
   ffmpeg reads 30 frames; WirePlumber not restarted. `gc2607-raw-capture.sh --fps 36`: 29.90 fps, 0 new CSI error
   lines, service back and listed.
 - Still owed [OWNER]: the stream starting first time on 3 boots/resumes.
+
+## D2 Driver hygiene (2026-10-18)
+
+Reset GPIO requested asserted (`GPIOD_OUT_HIGH`), so the sensor stays in reset from probe until `gc2607_power_on()`
+releases it; a short I2C transfer is an error (-EIO): read when `i2c_transfer()` moves fewer than 2 messages, write
+when `i2c_master_send()` sends fewer than 3 bytes (it returns bytes written, `include/linux/i2c.h` on 7.2.11, so the
+handover's "`ret != 1` on write" would have failed every write); routine probe, power and stream lines to `dev_dbg`
+("GC2607 probe successful" and the format line stay, `gc2607-reload.sh` greps the first); `MODULE_AUTHOR` names the
+two authors in the file's git history in place of the "Your Name" placeholder.
+
+`make modules`: only the usual pahole/BTF notes. `sudo -n ./gc2607-driver-install.sh`: DKMS for 7.2.9/7.2.10/7.2.11,
+`OK` in 319 s; `/usr/src/gc2607-1.0/gc2607.c` = the working tree (md5 1538e25c). Kernel log after the reload: only
+"GC2607 probe successful" and the format line per probe. A 5 s ffmpeg read: 126 frames; 0 "Failed to read/write reg"
+lines; the camera node in PipeWire survived the driver reload. Still owed [OWNER]: one suspend/resume, then a stream.

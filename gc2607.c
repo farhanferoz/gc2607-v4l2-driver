@@ -184,9 +184,9 @@ static int gc2607_read_reg(struct gc2607 *gc2607, u16 reg, u8 *val)
 	msgs[1].buf = val;
 
 	ret = i2c_transfer(client->adapter, msgs, 2);
-	if (ret < 0) {
+	if (ret != 2) {
 		dev_err(&client->dev, "Failed to read reg 0x%04x: %d\n", reg, ret);
-		return ret;
+		return ret < 0 ? ret : -EIO;
 	}
 
 	return 0;
@@ -202,10 +202,11 @@ static int gc2607_write_reg(struct gc2607 *gc2607, u16 reg, u8 val)
 	buf[1] = reg & 0xff;
 	buf[2] = val;
 
-	ret = i2c_master_send(client, buf, 3);
-	if (ret < 0) {
+	/* i2c_master_send() returns the number of bytes written */
+	ret = i2c_master_send(client, buf, sizeof(buf));
+	if (ret != (int)sizeof(buf)) {
 		dev_err(&client->dev, "Failed to write reg 0x%04x: %d\n", reg, ret);
-		return ret;
+		return ret < 0 ? ret : -EIO;
 	}
 
 	return 0;
@@ -236,7 +237,7 @@ static int gc2607_write_array(struct gc2607 *gc2607,
 		}
 	}
 
-	dev_info(&client->dev, "Wrote %u registers successfully\n", i);
+	dev_dbg(&client->dev, "Wrote %u registers successfully\n", i);
 	return 0;
 }
 
@@ -394,7 +395,7 @@ static int gc2607_power_on(struct gc2607 *gc2607)
 	struct i2c_client *client = gc2607->client;
 	int ret;
 
-	dev_info(&client->dev, "%s: Powering on sensor\n", __func__);
+	dev_dbg(&client->dev, "%s: Powering on sensor\n", __func__);
 
 	/* Enable regulators if available */
 	if (gc2607->supplies[0].supply) {
@@ -464,7 +465,7 @@ static int gc2607_power_on(struct gc2607 *gc2607)
 	msleep(20);
 
 	gc2607->powered = true;
-	dev_info(&client->dev, "Sensor powered on\n");
+	dev_dbg(&client->dev, "Sensor powered on\n");
 
 	return 0;
 
@@ -478,7 +479,7 @@ static void gc2607_power_off(struct gc2607 *gc2607)
 {
 	struct i2c_client *client = gc2607->client;
 
-	dev_info(&client->dev, "%s: Powering off sensor\n", __func__);
+	dev_dbg(&client->dev, "%s: Powering off sensor\n", __func__);
 
 	if (!gc2607->powered)
 		return;
@@ -505,7 +506,7 @@ static void gc2607_power_off(struct gc2607 *gc2607)
 		regulator_bulk_disable(ARRAY_SIZE(gc2607->supplies), gc2607->supplies);
 
 	gc2607->powered = false;
-	dev_info(&client->dev, "Sensor powered off\n");
+	dev_dbg(&client->dev, "Sensor powered off\n");
 }
 
 /*
@@ -629,7 +630,7 @@ static int gc2607_s_stream(struct v4l2_subdev *sd, int enable)
 		if (ret)
 			return ret;
 
-		dev_info(&client->dev, "Initializing sensor registers...\n");
+		dev_dbg(&client->dev, "Initializing sensor registers...\n");
 
 		/* Write initialization sequence for current mode */
 		ret = gc2607_write_array(gc2607, gc2607->cur_mode->reg_list);
@@ -647,10 +648,10 @@ static int gc2607_s_stream(struct v4l2_subdev *sd, int enable)
 			return ret;
 		}
 
-		dev_info(&client->dev, "Stream ON - sensor initialized\n");
+		dev_dbg(&client->dev, "Stream ON - sensor initialized\n");
 		gc2607->streaming = true;
 	} else {
-		dev_info(&client->dev, "Stream OFF\n");
+		dev_dbg(&client->dev, "Stream OFF\n");
 		gc2607->streaming = false;
 		pm_runtime_put(&client->dev);
 	}
@@ -757,7 +758,7 @@ static int gc2607_detect(struct gc2607 *gc2607)
 	u8 chip_id_h = 0, chip_id_l = 0;
 	int ret;
 
-	dev_info(&client->dev, "Detecting chip ID...\n");
+	dev_dbg(&client->dev, "Detecting chip ID...\n");
 
 	ret = gc2607_read_reg(gc2607, GC2607_REG_CHIP_ID_H, &chip_id_h);
 	if (ret) {
@@ -775,7 +776,7 @@ static int gc2607_detect(struct gc2607 *gc2607)
 		return ret;
 	}
 
-	dev_info(&client->dev, "Read chip ID: 0x%02x%02x\n", chip_id_h, chip_id_l);
+	dev_dbg(&client->dev, "Read chip ID: 0x%02x%02x\n", chip_id_h, chip_id_l);
 
 	if (chip_id_h != GC2607_CHIP_ID_H || chip_id_l != GC2607_CHIP_ID_L) {
 		dev_err(&client->dev,
@@ -785,7 +786,7 @@ static int gc2607_detect(struct gc2607 *gc2607)
 		return -ENODEV;
 	}
 
-	dev_info(&client->dev, "GC2607 chip detected successfully!\n");
+	dev_dbg(&client->dev, "GC2607 chip detected successfully!\n");
 
 	return 0;
 }
@@ -837,7 +838,7 @@ static int gc2607_probe(struct i2c_client *client)
 	struct gc2607 *gc2607;
 	int ret;
 
-	dev_info(dev, "GC2607 probe started\n");
+	dev_dbg(dev, "GC2607 probe started\n");
 
 	gc2607 = devm_kzalloc(dev, sizeof(*gc2607), GFP_KERNEL);
 	if (!gc2607)
@@ -858,12 +859,15 @@ static int gc2607_probe(struct i2c_client *client)
 		/* Clear supplies array to indicate no regulators */
 		memset(gc2607->supplies, 0, sizeof(gc2607->supplies));
 	} else {
-		dev_info(dev, "Got %d regulators from platform\n",
-			 (int)ARRAY_SIZE(gc2607->supplies));
+		dev_dbg(dev, "Got %d regulators from platform\n",
+			(int)ARRAY_SIZE(gc2607->supplies));
 	}
 
-	/* Get reset GPIO (optional on some platforms) */
-	gc2607->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	/*
+	 * Get reset GPIO (optional on some platforms), asserted: the sensor stays in
+	 * reset until gc2607_power_on() releases it after the supplies and clock.
+	 */
+	gc2607->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(gc2607->reset_gpio)) {
 		ret = PTR_ERR(gc2607->reset_gpio);
 		dev_err(dev, "Failed to get reset GPIO: %d\n", ret);
@@ -871,7 +875,7 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	if (gc2607->reset_gpio)
-		dev_info(dev, "Got reset GPIO\n");
+		dev_dbg(dev, "Got reset GPIO\n");
 	else
 		dev_warn(dev, "No reset GPIO, assuming INT3472 handles it\n");
 
@@ -885,7 +889,7 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	if (gc2607->powerdown_gpio)
-		dev_info(dev, "Got powerdown GPIO\n");
+		dev_dbg(dev, "Got powerdown GPIO\n");
 	else
 		dev_dbg(dev, "No powerdown GPIO\n");
 
@@ -898,13 +902,13 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	if (gc2607->xclk) {
-		dev_info(dev, "Got clock from platform: %lu Hz\n",
-			 clk_get_rate(gc2607->xclk));
+		dev_dbg(dev, "Got clock from platform: %lu Hz\n",
+			clk_get_rate(gc2607->xclk));
 	} else {
 		dev_warn(dev, "No clock from platform, assuming INT3472 provides it\n");
 	}
 
-	dev_info(dev, "Resources acquired successfully\n");
+	dev_dbg(dev, "Resources acquired successfully\n");
 
 	/* Initialize V4L2 subdev */
 	v4l2_i2c_subdev_init(&gc2607->sd, client, &gc2607_subdev_ops);
@@ -1060,8 +1064,8 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	dev_info(dev, "GC2607 probe successful\n");
-	dev_info(dev, "  I2C address: 0x%02x\n", client->addr);
-	dev_info(dev, "  I2C adapter: %s\n", client->adapter->name);
+	dev_dbg(dev, "  I2C address: 0x%02x\n", client->addr);
+	dev_dbg(dev, "  I2C adapter: %s\n", client->adapter->name);
 	dev_info(dev, "  Format: SGRBG10 %ux%u@%ufps\n",
 		 gc2607->cur_mode->width, gc2607->cur_mode->height,
 		 gc2607->cur_mode->max_fps);
@@ -1087,7 +1091,7 @@ static void gc2607_remove(struct i2c_client *client)
 	struct gc2607 *gc2607 = to_gc2607(sd);
 	struct device *dev = &client->dev;
 
-	dev_info(dev, "GC2607 driver removing\n");
+	dev_dbg(dev, "GC2607 driver removing\n");
 
 	v4l2_async_unregister_subdev(sd);
 	media_entity_cleanup(&sd->entity);
@@ -1099,7 +1103,7 @@ static void gc2607_remove(struct i2c_client *client)
 		gc2607_power_off(gc2607);
 	pm_runtime_set_suspended(dev);
 
-	dev_info(dev, "GC2607 driver removed\n");
+	dev_dbg(dev, "GC2607 driver removed\n");
 }
 
 /*
@@ -1134,5 +1138,6 @@ static struct i2c_driver gc2607_i2c_driver = {
 module_i2c_driver(gc2607_i2c_driver);
 
 MODULE_DESCRIPTION("GalaxyCore GC2607 sensor driver");
-MODULE_AUTHOR("Your Name <your.email@example.com>");
+MODULE_AUTHOR("abdulah bakhach <abdullah.bakhach@gmail.com>");
+MODULE_AUTHOR("Farhan Feroz <farhan.feroz@gmail.com>");
 MODULE_LICENSE("GPL");
