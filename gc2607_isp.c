@@ -31,10 +31,6 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/inotify.h>
-#include <sys/select.h>
-#include <dirent.h>
-#include <limits.h>
 #include <linux/videodev2.h>
 
 /* Sensor parameters */
@@ -152,15 +148,22 @@ static inline float gain_of(int index) { return gain_x64[index] / 64.0f; }
 /* Lazy activation: how often to write standby frames while idle (ms) */
 #define STANDBY_INTERVAL_MS  2000
 
-/* During streaming, how often to check if consumers are still present (s) */
-#define CONSUMER_CHECK_INTERVAL_S  2.0
+/* After the last reader stops streaming, how long to keep the sensor on in case one returns (s) */
+#define READER_GRACE_S  3.0
+
+/*
+ * v4l2loopback's client-usage event; its header is not installed. From v4l2loopback 0.15.4,
+ * v4l2loopback.c ~line 818 (/usr/src/akmods/v4l2loopback-kmod-0.15.4-1.fc44.src.rpm): `count` is 1
+ * while a reader holds the capture stream. It is queued on a reader's STREAMON and STREAMOFF and on
+ * close (close calls REQBUFS(0), which calls STREAMOFF), so a crashed reader ends it too, and the
+ * device's poll reports it as POLLPRI on every opener, including this writer.
+ */
+#define V4L2_EVENT_PRI_CLIENT_USAGE  (V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1)
+struct v4l2_event_client_usage {
+    __u32 count;
+};
 
 static volatile sig_atomic_t running = 1;
-
-/* inotify-based consumer tracking */
-static int inotify_fd = -1;
-static int inotify_wd = -1;
-static int consumer_count = 0;
 
 struct buffer {
     void   *start;
@@ -1081,174 +1084,54 @@ static int open_output(const char *dev)
     return fd;
 }
 
-/*
- * Initialise inotify watch on the output device.
- * Watches for IN_OPEN and IN_CLOSE events so we know when consumers
- * attach/detach without scanning /proc (which is fragile and slow).
- *
- * Must be called AFTER the ISP opens out_fd, so that our own open()
- * is not counted.
- */
-static int init_inotify(const char *output_dev)
+/* Ask for the client-usage event on the output fd, with the current state sent at once. */
+static int subscribe_reader_events(int out_fd)
 {
-    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (inotify_fd < 0) {
-        perror("inotify_init1");
-        return -1;
-    }
-
-    inotify_wd = inotify_add_watch(inotify_fd, output_dev,
-                                    IN_OPEN | IN_CLOSE);
-    if (inotify_wd < 0) {
-        perror("inotify_add_watch");
-        close(inotify_fd);
-        inotify_fd = -1;
-        return -1;
-    }
-
-    consumer_count = 0;
-    return 0;
+    struct v4l2_event_subscription sub = {
+        .type = V4L2_EVENT_PRI_CLIENT_USAGE,
+        .flags = V4L2_EVENT_SUB_FL_SEND_INITIAL,
+    };
+    return xioctl(out_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
 }
 
 /*
- * Drain all pending inotify events and update consumer_count.
- * Call this periodically (it is non-blocking).
+ * Dequeue the pending client-usage events and return the latest reader count (`readers` if none).
+ * Call only after poll() reported POLLPRI: the fd is blocking, so DQEVENT with nothing queued
+ * would wait for the next event.
  */
-static void drain_inotify(void)
+static int take_reader_events(int out_fd, int readers)
 {
-    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-
-    for (;;) {
-        ssize_t len = read(inotify_fd, buf, sizeof(buf));
-        if (len <= 0)
+    struct v4l2_event ev;
+    do {
+        if (xioctl(out_fd, VIDIOC_DQEVENT, &ev) < 0)
             break;
-
-        const struct inotify_event *ev;
-        for (char *ptr = buf; ptr < buf + len;
-             ptr += sizeof(struct inotify_event) + ev->len) {
-            ev = (const struct inotify_event *)ptr;
-
-            if (ev->mask & IN_OPEN)
-                consumer_count++;
-            if (ev->mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)) {
-                consumer_count--;
-                if (consumer_count < 0)
-                    consumer_count = 0;
-            }
-        }
-    }
+        if (ev.type == V4L2_EVENT_PRI_CLIENT_USAGE)
+            readers = ((const struct v4l2_event_client_usage *)&ev.u)->count;
+    } while (ev.pending > 0);
+    return readers;
 }
 
-static void cleanup_inotify(void)
+/* Fill the output with black (YUYV limited range), the frame idle readers and the next app see. */
+static void fill_standby(void)
 {
-    if (inotify_wd >= 0) {
-        inotify_rm_watch(inotify_fd, inotify_wd);
-        inotify_wd = -1;
+    for (size_t i = 0; i < out_bytes(); i += 4) {
+        yuyv_buf[i] = 16;
+        yuyv_buf[i + 1] = 128;
+        yuyv_buf[i + 2] = 16;
+        yuyv_buf[i + 3] = 128;
     }
-    if (inotify_fd >= 0) {
-        close(inotify_fd);
-        inotify_fd = -1;
-    }
-}
-
-/*
- * Count how many processes currently have output_dev open by scanning
- * /proc/<PID>/fd/<N> symlinks. Used as a fallback when inotify misses
- * IN_OPEN/IN_CLOSE events on V4L2 character devices.
- *
- * Resolves the real path of output_dev once (via realpath) then compares
- * symlink targets. Gracefully skips entries we cannot read.
- */
-static int count_proc_consumers(const char *output_dev)
-{
-    static char real_dev[PATH_MAX];
-    static int resolved;
-    if (!resolved) {
-        if (!realpath(output_dev, real_dev))
-            return 0;
-        resolved = 1;
-    }
-
-    DIR *proc = opendir("/proc");
-    if (!proc)
-        return 0;
-
-    int count = 0;
-    pid_t self = getpid();
-    struct dirent *pid_ent;
-    while ((pid_ent = readdir(proc)) != NULL) {
-        /* Only numeric entries (PIDs) */
-        if (pid_ent->d_name[0] < '1' || pid_ent->d_name[0] > '9')
-            continue;
-
-        /* Skip our own process — we hold out_fd open permanently */
-        if (atoi(pid_ent->d_name) == self)
-            continue;
-
-        char fd_dir[PATH_MAX];
-        snprintf(fd_dir, sizeof(fd_dir), "/proc/%s/fd", pid_ent->d_name);
-
-        DIR *fds = opendir(fd_dir);
-        if (!fds)
-            continue;
-
-        struct dirent *fd_ent;
-        while ((fd_ent = readdir(fds)) != NULL) {
-            if (fd_ent->d_name[0] == '.')
-                continue;
-
-            char link_path[PATH_MAX];
-            snprintf(link_path, sizeof(link_path), "/proc/%s/fd/%s",
-                     pid_ent->d_name, fd_ent->d_name);
-
-            char target[PATH_MAX];
-            ssize_t n = readlink(link_path, target, sizeof(target) - 1);
-            if (n > 0) {
-                target[n] = '\0';
-                if (strcmp(target, real_dev) == 0)
-                    count++;
-            }
-        }
-        closedir(fds);
-    }
-    closedir(proc);
-    return count;
-}
-
-/*
- * Return the best estimate of the current consumer count.
- * inotify is the fast path; /proc is the ground-truth fallback.
- * We trust whichever reports more consumers, except when /proc says
- * zero we always believe it (inotify missed a close).
- */
-static int get_consumer_count(const char *output_dev)
-{
-    drain_inotify();
-    int proc_count = count_proc_consumers(output_dev);
-
-    if (proc_count == 0) {
-        /* Ground truth: nobody has the device open */
-        consumer_count = 0;
-        return 0;
-    }
-    /* Trust the higher of the two */
-    if (proc_count > consumer_count)
-        consumer_count = proc_count;
-    return consumer_count;
 }
 
 /*
  * Run the streaming loop: capture frames from the sensor, process them
  * through the ISP pipeline, and write to the output device.
  *
- * Exits when: running becomes 0 (signal), or no consumers remain for
- * several consecutive poll intervals.
+ * Exits when: running becomes 0 (signal), or no reader has been streaming for READER_GRACE_S.
  *
- * Returns: 0 on clean consumer-loss exit, -1 on error.
+ * Returns: 0 on a clean exit, -1 on error.
  */
 static int streaming_loop(const char *capture_dev, int out_fd,
-                          const char *subdev_path, int has_subdev,
-                          const char *output_dev)
+                          const char *subdev_path, int has_subdev)
 {
     struct buffer buffers[NUM_BUFFERS];
     int n_buffers = 0;
@@ -1283,31 +1166,43 @@ static int streaming_loop(const char *capture_dev, int out_fd,
            out_w, out_h, ae.cur.exposure, ae.cur.gain, ae.cur.fll, ae.cur.d, ae.flicker_lines);
 
     int frame_count = 0;
-    int no_consumer_count = 0;
+    int readers = 1;           /* a streaming reader started this session */
+    int reader_left = 0;       /* stopped because no reader streamed for READER_GRACE_S */
 
-    struct timespec now, last_consumer_check, last_status;
-    clock_gettime(CLOCK_MONOTONIC, &last_consumer_check);
-    last_status = last_consumer_check;
+    struct timespec now, last_frame, idle_since, last_status;
+    clock_gettime(CLOCK_MONOTONIC, &last_frame);
+    last_status = idle_since = last_frame;
 
-    int stalled_s = 0;
     while (running) {
-        /* Wait at most a second for a frame, so a stalled sensor or a SIGTERM is
-         * noticed instead of blocking in DQBUF for ever. */
-        struct pollfd pfd = { .fd = cap_fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 1000);
+        /* Frames arrive on the capture fd and reader changes as POLLPRI on the output fd. Wait at
+         * most a second, so a stalled sensor or a SIGTERM is noticed instead of blocking for ever. */
+        struct pollfd pfd[2] = { { .fd = cap_fd, .events = POLLIN }, { .fd = out_fd, .events = POLLPRI } };
+        int pr = poll(pfd, 2, 1000);
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("poll capture");
             break;
         }
-        if (pr == 0) {
-            if (++stalled_s >= CAPTURE_STALL_S) {
-                printf("[gc2607_isp] No frame for %ds, restarting capture\n", stalled_s);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (pfd[1].revents & POLLPRI) {
+            int was = readers;
+            readers = take_reader_events(out_fd, readers);
+            if (was > 0 && readers == 0)
+                idle_since = now;
+        }
+        if (readers == 0 && seconds_between(&idle_since, &now) >= READER_GRACE_S) {
+            printf("[gc2607_isp] No reader streaming, stopping stream (%d frames)\n", frame_count);
+            reader_left = 1;
+            break;
+        }
+        if (!(pfd[0].revents & POLLIN)) {
+            if (seconds_between(&last_frame, &now) >= CAPTURE_STALL_S) {
+                printf("[gc2607_isp] No frame for %ds, restarting capture\n", CAPTURE_STALL_S);
                 break;
             }
             continue;
         }
-        stalled_s = 0;
+        last_frame = now;
 
         /* Dequeue a capture buffer */
         struct v4l2_buffer buf = {0};
@@ -1367,7 +1262,6 @@ static int streaming_loop(const char *capture_dev, int out_fd,
             break;
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &now);
         frame_count++;
         if (frame_count % 150 == 0) {
             printf("[gc2607_isp] %d frames | %.1f fps | WB: R=%.2f G=%.2f B=%.2f | exp=%d gain=%d fll=%d d=%.2f"
@@ -1377,34 +1271,14 @@ static int streaming_loop(const char *capture_dev, int out_fd,
                    mt.y, mt.p98, 100.0f * mt.clipped, mt.m, ctrl_failures);
             last_status = now;
         }
-
-        /*
-         * Periodically check if consumers are still attached.
-         * If no consumers for 5 consecutive checks (~10s), stop streaming
-         * to release the hardware and save power.
-         */
-        if (seconds_between(&last_consumer_check, &now) >= CONSUMER_CHECK_INTERVAL_S) {
-            last_consumer_check = now;
-            if (get_consumer_count(output_dev) <= 0) {
-                no_consumer_count++;
-                if (no_consumer_count >= 5) {
-                    printf("[gc2607_isp] No consumers detected, stopping stream (%d frames)\n",
-                           frame_count);
-                    close_capture(cap_fd, buffers, n_buffers);
-                    if (sub_fd >= 0)
-                        close(sub_fd);
-                    return 0;
-                }
-            } else {
-                no_consumer_count = 0;
-            }
-        }
     }
 
-    printf("[gc2607_isp] Shutting down (%d frames total)\n", frame_count);
     close_capture(cap_fd, buffers, n_buffers);
     if (sub_fd >= 0)
         close(sub_fd);
+    if (reader_left)
+        return 0;
+    printf("[gc2607_isp] Shutting down (%d frames total)\n", frame_count);
     return running ? -1 : 0;
 }
 
@@ -1441,85 +1315,52 @@ int main(int argc, char *argv[])
     if (out_fd < 0)
         return 1;
 
-    /* Set up inotify AFTER opening out_fd so our own open isn't counted */
-    if (init_inotify(output_dev) < 0) {
-        fprintf(stderr, "[gc2607_isp] Failed to set up inotify, exiting\n");
+    if (subscribe_reader_events(out_fd) < 0) {
+        perror("[gc2607_isp] VIDIOC_SUBSCRIBE_EVENT (v4l2loopback client usage)");
         close(out_fd);
         return 1;
     }
-    printf("[gc2607_isp] Consumer detection via inotify on %s\n", output_dev);
 
     /*
-     * Main idle/stream loop:
-     *   - While idle: write a black standby frame periodically so that
-     *     PipeWire/wireplumber sees the device as active and camera apps
-     *     can discover it. Use select() on inotify_fd to wake instantly
-     *     when a consumer opens the device.
-     *   - When a consumer opens /dev/video50: start capturing from the
-     *     sensor, process frames through the ISP, and write to output.
-     *   - When all consumers close: stop streaming and return to idle.
+     * Idle until a reader starts streaming from /dev/video50 (v4l2loopback's client-usage
+     * event), writing a black standby frame every STANDBY_INTERVAL_MS so PipeWire and camera
+     * apps can discover and probe the device; then stream until no reader is left.
      */
-
-    /* Prepare a black standby frame (Y=16, U=128, V=128 = black in YUYV) */
-    for (size_t i = 0; i < out_bytes(); i += 4) {
-        yuyv_buf[i]     = 16;   /* Y0 */
-        yuyv_buf[i + 1] = 128;  /* U  */
-        yuyv_buf[i + 2] = 16;   /* Y1 */
-        yuyv_buf[i + 3] = 128;  /* V  */
-    }
-    /* Write initial standby frame so wireplumber can probe successfully */
+    fill_standby();
     write(out_fd, yuyv_buf, out_bytes());
-
     printf("[gc2607_isp] Idle, waiting for consumers on %s...\n", output_dev);
 
+    int readers = 0, stream_fails = 0;
     while (running) {
-        /*
-         * Wait for inotify events (consumer open) with a timeout.
-         * The timeout ensures we periodically write standby frames
-         * to keep v4l2loopback alive for PipeWire device discovery.
-         */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(inotify_fd, &rfds);
-        struct timeval tv;
-        tv.tv_sec = STANDBY_INTERVAL_MS / 1000;
-        tv.tv_usec = (STANDBY_INTERVAL_MS % 1000) * 1000;
-
-        int sel = select(inotify_fd + 1, &rfds, NULL, NULL, &tv);
-
-        if (sel > 0)
-            drain_inotify();
-
-        if (get_consumer_count(output_dev) > 0) {
-            printf("[gc2607_isp] %d consumer(s) detected, starting stream...\n",
-                   consumer_count);
-            int ret = streaming_loop(capture_dev, out_fd,
-                                     subdev_path, has_subdev, output_dev);
-            static int stream_fails;
-            stream_fails = (ret < 0) ? stream_fails + 1 : 0;
-            if (ret < 0 && running && stream_fails >= MAX_STREAM_FAILS) {
-                /* Retrying in-process has stopped helping; exit non-zero so
-                 * Restart=on-failure starts from a clean process. */
-                printf("[gc2607_isp] %d streaming failures in a row, exiting\n", stream_fails);
-                cleanup_inotify();
-                close(out_fd);
-                return 1;
-            }
-            if (ret < 0 && running) {
-                printf("[gc2607_isp] Streaming error, retrying in 2s...\n");
-                sleep(2);
-            }
-            if (running)
-                printf("[gc2607_isp] Idle, waiting for consumers on %s...\n",
-                       output_dev);
-        } else {
-            /* Write standby frame to keep v4l2loopback alive */
+        struct pollfd pfd = { .fd = out_fd, .events = POLLPRI };
+        if (poll(&pfd, 1, STANDBY_INTERVAL_MS) > 0 && (pfd.revents & POLLPRI))
+            readers = take_reader_events(out_fd, readers);
+        if (readers == 0) {
             write(out_fd, yuyv_buf, out_bytes());
+            continue;
         }
+
+        printf("[gc2607_isp] A reader is streaming, starting stream...\n");
+        int ret = streaming_loop(capture_dev, out_fd, subdev_path, has_subdev);
+        readers = 0;   /* the loop consumed the events up to its exit */
+        stream_fails = (ret < 0) ? stream_fails + 1 : 0;
+        if (ret < 0 && running && stream_fails >= MAX_STREAM_FAILS) {
+            /* Retrying in-process has stopped helping; exit non-zero so
+             * Restart=on-failure starts from a clean process. */
+            printf("[gc2607_isp] %d streaming failures in a row, exiting\n", stream_fails);
+            close(out_fd);
+            return 1;
+        }
+        if (ret < 0 && running) {
+            printf("[gc2607_isp] Streaming error, retrying in 2s...\n");
+            sleep(2);
+        }
+        fill_standby();   /* never leave the last camera frame on the device */
+        if (running)
+            printf("[gc2607_isp] Idle, waiting for consumers on %s...\n", output_dev);
     }
 
     printf("[gc2607_isp] Exiting\n");
-    cleanup_inotify();
     close(out_fd);
 
     return 0;

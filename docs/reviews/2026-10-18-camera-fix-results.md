@@ -204,3 +204,32 @@ change): every capture with signal settles at Y 0.45-0.48 (baseline 0.02-0.54); 
 captures (<= 2.3%); raw-saturated highlights render neutral (hl_neutral 0.0). Covered-lens and dark captures show high
 chroma noise because the replay boosts them digitally without limit; live, the controller lengthens the exposure.
 `make bench`: 10.33 ms cpu 0, 20.53 ms cpu 12 (unchanged by the controller).
+
+## Live: Q3b, Q1 and R3 in room light (2026-10-18 15:08, camera on, owner away with permission)
+
+Deployed with `sudo -n ./gc2607-setup-service.sh unit` (CPUAffinity) and `make isp && sudo -n ./gc2607-install-isp.sh`
+(`OK`); the ISP starts at 1920x1080 and `taskset -cp` shows 0-19. A 65 s `ffmpeg -f v4l2 -i /dev/video50 -f null -`:
+- `v4l2-ctl -d /dev/video50 --get-fmt-video`: 1920/1080 YUYV. ffmpeg: 1931 frames, 30 fps, speed 1x.
+- ISP CPU over 60 s of streaming (utime+stime from /proc): **43% of one core** (bar 75%).
+- Status lines: 29.9 fps; exposure lowered from the 1002-line start to 668 (two 10 ms periods) at gain 0; d 1.11-1.33,
+  never below 1; Y 0.40-0.42 with P98 0.90-0.93 and 1.9% of samples in the top bin (the room's bright window holds
+  Y just under the 0.45 target through the highlight cap); 0 failed control writes.
+- R3: streams normally on the driver with the new error path. Its suspend/resume check is still owed.
+Light-change checks (lights off/on, backlit), the flicker capture and a few days of logs remain for the owner.
+
+## E1 Reader detection by v4l2loopback's client-usage event (2026-10-18)
+
+Verified in the installed v4l2loopback 0.15.4 source (`/usr/src/akmods/v4l2loopback-kmod-0.15.4-1.fc44.src.rpm`):
+event type `V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1`, payload `{__u32 count}` = 1 while a reader holds the capture
+stream (`client_usage_queue_event`, ~line 2147), queued on capture STREAMON and STREAMOFF and on close via REQBUFS(0);
+`v4l2_loopback_poll` reports a pending event as POLLPRI to every opener. inotify and the /proc walk are gone; the idle
+loop polls the output fd for POLLPRI with the 2 s standby timeout, the streaming loop polls it beside the capture fd
+and stops 3 s after the count drops to 0. The standby frame is re-blacked after every session (the last camera frame
+used to stay on the device for the next app). Unit and replay tests unchanged and passing (I/O only, no new test).
+
+Live (`make isp && sudo -n ./gc2607-install-isp.sh`, `OK`): a 10 s ffmpeg read started streaming **0.15 s** after
+ffmpeg opened the device and stopped **3.0 s** after it ended (bars 1 s and 5 s); `kill -9` of a streaming ffmpeg
+stopped it **3.0 s** later; `systemctl --user restart wireplumber` with no app open started **no** stream in 10 s.
+ffmpeg reported 5-6 "non monotonically increasing dts" warnings per 10 s run (repeated frames from the loopback);
+not investigated. Idle CPU: `CPUUsageNSec` 8,103,450,000 at unix 1792332618; second reading owed (bar <= 0.6 s per
+10 minutes).
