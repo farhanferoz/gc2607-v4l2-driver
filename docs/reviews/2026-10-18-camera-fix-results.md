@@ -234,3 +234,34 @@ ffmpeg reported 5-6 "non monotonically increasing dts" warnings per 10 s run (re
 not investigated. Idle CPU (`systemctl show -p CPUUsageNSec`, same invocation, no stream started in between):
 8,103,450,000 ns at unix 1792332618, 8,370,610,000 at 1792333224, i.e. **0.27 s in 606 s, 0.26 s per 10 minutes**
 (bar 0.6 s; ~19 s before).
+
+## E2 v4l2loopback loaded once; WirePlumber restarted only when it misses the camera (2026-10-18)
+
+New `gc2607-setup-service.sh loopback` writes `/etc/modprobe.d/gc2607-v4l2loopback.conf` (the options the service
+used to pass) and `/etc/modules-load.d/gc2607-v4l2loopback.conf`; `modprobe --showconfig` shows ours as the only
+v4l2loopback options line (the OBS and v4l2-relayd package files are masked to /dev/null in /etc since May).
+`gc2607-service.sh` keeps a loaded module and refuses to start unless `/dev/video50` is named "GC2607 Camera". New
+`scripts` sub-command installs the service scripts to /opt without the full setup.
+
+Test without the WirePlumber restart (ExecStartPost removed, `pw-dump` node id, `wpctl status` sources, a 30-frame
+ffmpeg read of /dev/video50):
+- 3 service restarts: node 60 (serial 9131) kept every time, listed, 30 frames, WirePlumber not restarted. PASS.
+- Boot order (measured this boot: WirePlumber 09:06:39, camera service 09:06:54), simulated by restarting WirePlumber
+  while the service was stopped (`/dev/video50` then announces only Video Output): **no node, not listed, still
+  none 2 minutes after the ISP was back**; ffmpeg on the device worked. PipeWire decides once whether a device is
+  a camera and is not told when v4l2loopback's capabilities change. FAIL.
+
+So the restart stays, conditionally: `gc2607-restart-wireplumber.sh` waits up to 15 s for the device to announce
+capture, then restarts WirePlumber only if `pw-cli ls Node` lacks the camera's node, logging which it did (also
+when there is no user session yet). With it installed: 3 restarts logged "already lists the camera; not
+restarting it" (node 114 kept, WirePlumber start time unchanged); the boot simulation logged "did not list the
+camera; restarted it" and the camera was listed and read 30 frames. The full setup no longer restarts WirePlumber
+itself. Still owed [OWNER]: one suspend/resume (with R3's) and a browser camera test.
+
+**Found on the way, not fixed: a PipeWire client gets no frames from the camera.** `gst-launch-1.0 pipewiresrc`
+(auto-linked: "target not found"; linked by hand with `pw-link`: no buffers, ISP never saw a reader). PipeWire's log:
+`(60.0.0 -> 115.0.0) allocating -> error error alloc buffers: Operation not supported (-95)`; at log level 4 the camera
+node offered buffers with dataType mask 8, i.e. DmaBuf only (1 << SPA_DATA_DmaBuf). PipeWire 1.6.9, WirePlumber 0.5.18, v4l2loopback 0.15.4. Not caused
+by E2 (the module was not reloaded); whether it ever worked is unknown: 60 days of PipeWire logs hold no earlier
+attempt. Apps that open /dev/video50 directly (ffmpeg; browsers without PipeWire camera support) are unaffected;
+apps that go through PipeWire (GNOME Snapshot, a browser with PipeWire camera on) would show no picture.

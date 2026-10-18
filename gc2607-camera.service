@@ -14,6 +14,7 @@ Before=sleep.target
 [Service]
 Type=simple
 ExecStart=/opt/gc2607/gc2607-service.sh
+# Restarts WirePlumber only if it does not list the camera (after boot, not after a restart or resume).
 ExecStartPost=/opt/gc2607/gc2607-restart-wireplumber.sh
 # on-failure, not on-abnormal: gc2607_isp exits 1 after repeated streaming failures so a
 # fresh process can recover, and on-abnormal would leave that exit dead. A SIGTERM from

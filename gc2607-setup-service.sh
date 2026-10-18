@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install and enable the GC2607 camera systemd service.
-# Usage: sudo ./gc2607-setup-service.sh
+# Usage: sudo ./gc2607-setup-service.sh [unit|scripts|loopback]   (no argument: full install)
 
 set -euo pipefail
 
@@ -14,12 +14,39 @@ INSTALL_DIR="/opt/gc2607"
 
 # `unit`: install gc2607-camera.service only and reload systemd. The running service is not
 # restarted; the new unit applies from its next start.
-if [ "${1:-}" = unit ]; then
+install_unit() {
     install -m 0644 "${SCRIPT_DIR}/gc2607-camera.service" /etc/systemd/system/gc2607-camera.service
     systemctl daemon-reload
-    echo "Installed gc2607-camera.service (effective from the next start)."
-    exit 0
-fi
+}
+
+# `scripts`: copy the service's scripts to /opt/gc2607, with gc2607-service.sh pointed at it. They apply
+# from the next service start (the ISP binary has its own installer, gc2607-install-isp.sh).
+install_scripts() {
+    mkdir -p "$INSTALL_DIR"
+    install -m 0755 "${SCRIPT_DIR}/gc2607_virtualcam.py" "${SCRIPT_DIR}/gc2607-service.sh" \
+        "${SCRIPT_DIR}/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
+    sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" "$INSTALL_DIR/gc2607-service.sh"
+}
+
+# `loopback`: have v4l2loopback loaded once at boot with the camera's options, so gc2607-service.sh
+# keeps the module across restarts instead of reloading it. A module already loaded is left alone.
+install_loopback() {
+    printf '# Written by gc2607-setup-service.sh loopback.\n%s\n' \
+        'options v4l2loopback devices=1 video_nr=50 card_label="GC2607 Camera" exclusive_caps=1 max_buffers=2' \
+        > /etc/modprobe.d/gc2607-v4l2loopback.conf
+    printf '# Written by gc2607-setup-service.sh loopback.\nv4l2loopback\n' > /etc/modules-load.d/gc2607-v4l2loopback.conf
+    modprobe v4l2loopback
+    echo "Installed v4l2loopback options and boot load; /dev/video50 is '$(cat /sys/class/video4linux/video50/name 2>/dev/null)'."
+}
+
+case "${1:-}" in
+    unit) install_unit; echo "Installed gc2607-camera.service (effective from the next start)."; exit 0 ;;
+    scripts) install_scripts; echo "Installed the service scripts to ${INSTALL_DIR} (effective from the next start)."; exit 0 ;;
+    loopback) install_loopback; exit 0 ;;
+    "") ;;
+    *) echo "Usage: sudo $0 [unit|scripts|loopback]" >&2; exit 1 ;;
+esac
+
 USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 USER_HOME=$(getent passwd "$USER" | cut -d: -f6)
 
@@ -61,16 +88,8 @@ fi
 
 # Copy scripts and binary to /opt where systemd can access them
 echo "Installing to ${INSTALL_DIR}..."
-mkdir -p "$INSTALL_DIR"
-cp "${SCRIPT_DIR}/gc2607_virtualcam.py" "$INSTALL_DIR/"
-cp "${SCRIPT_DIR}/gc2607-service.sh" "$INSTALL_DIR/"
-cp "${SCRIPT_DIR}/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
-[ -f "${SCRIPT_DIR}/gc2607_isp" ] && cp "${SCRIPT_DIR}/gc2607_isp" "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR"/*.sh "$INSTALL_DIR"/*.py
-[ -f "$INSTALL_DIR/gc2607_isp" ] && chmod +x "$INSTALL_DIR/gc2607_isp"
-
-# Update service script to use /opt paths
-sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" "$INSTALL_DIR/gc2607-service.sh"
+install_scripts
+[ -f "${SCRIPT_DIR}/gc2607_isp" ] && install -m 0755 "${SCRIPT_DIR}/gc2607_isp" "$INSTALL_DIR/"
 
 # Save the detected Python path so the service can find it at boot
 echo "$PYTHON" > "$INSTALL_DIR/.python-path"
@@ -104,21 +123,16 @@ monitor.v4l2.rules = [
 EOF
 chown -R "${USER}:${USER}" "${USER_HOME}/.config/wireplumber"
 
+install_loopback
+
 # Install systemd service
 echo "Installing systemd service..."
-install -m 0644 "${SCRIPT_DIR}/gc2607-camera.service" /etc/systemd/system/gc2607-camera.service
-
-systemctl daemon-reload
+install_unit
 systemctl enable gc2607-camera.service
 
-# Start now
+# Start now; the start job includes ExecStartPost, which restarts WirePlumber if it misses the camera.
 echo "Starting service..."
 systemctl start gc2607-camera.service
-sleep 8
-
-# Manually restart wireplumber now (service ExecStartPost may still be waiting)
-su - "$USER" -c "systemctl --user restart wireplumber" 2>/dev/null || true
-sleep 2
 
 # Check status
 if systemctl is-active --quiet gc2607-camera.service; then

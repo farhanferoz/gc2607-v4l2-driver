@@ -70,21 +70,16 @@ v4l2-ctl -d "$CAPTURE_DEV" --set-fmt-video=width=1920,height=1080,pixelformat=BA
 
 log "Pipeline configured"
 
-# ── Load v4l2loopback ───────────────────────────────────────────────
+# ── v4l2loopback ────────────────────────────────────────────────────
+# Loaded once per boot (/etc/modules-load.d) with its options from /etc/modprobe.d, both written by
+# `gc2607-setup-service.sh loopback`, and kept across service restarts so the camera node PipeWire
+# already has survives them; only after boot does WirePlumber need a restart (gc2607-restart-wireplumber.sh).
 
-if grep -q "^v4l2loopback " /proc/modules; then
-    modprobe -r v4l2loopback 2>/dev/null || true
-    sleep 1
+modprobe v4l2loopback
+if [ "$(cat /sys/class/video4linux/video50/name 2>/dev/null)" != "GC2607 Camera" ]; then
+    die "/dev/video50 is not the GC2607 loopback: run 'sudo ./gc2607-setup-service.sh loopback', then reboot or unload v4l2loopback"
 fi
-
-modprobe v4l2loopback \
-    devices=1 \
-    video_nr=50 \
-    card_label="GC2607 Camera" \
-    exclusive_caps=1 \
-    max_buffers=2
-
-log "v4l2loopback loaded on /dev/video50"
+log "v4l2loopback ready on /dev/video50"
 
 # ── Start C ISP (or fallback to Python virtualcam) ─────────────────
 
