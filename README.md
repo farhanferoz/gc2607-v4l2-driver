@@ -37,7 +37,7 @@ This driver successfully ports the GC2607 sensor from embedded platforms to main
 ✅ Power management via INT3472 PMIC
 ✅ Runtime PM support
 ✅ Proper reset sequencing
-✅ **Exposure control (V4L2_CID_EXPOSURE) - range 4-2002**
+✅ **Exposure control (V4L2_CID_EXPOSURE) - range 4 to frame length - 8 (1108 lines at 30 fps)**
 ✅ **Analog gain control (V4L2_CID_ANALOGUE_GAIN) - LUT index 0-16**
 ✅ **Gray world white balance** during Bayer-to-RGB conversion
 ✅ **OBS Studio integration with virtual RGB camera**
@@ -83,211 +83,24 @@ make
 
 ## Usage
 
-> **Historical: upstream's manual path.** On this laptop the modules are installed through DKMS
-> (`dkms-setup.sh`, rebuilt on every kernel update) and the camera runs from `gc2607-camera.service`
-> (`gc2607-setup-service.sh`); see `docs/operations-runbook.md`. `init_camera.sh` and
-> `create_virtual_camera.sh` below are not used.
+On this laptop the camera runs as `gc2607-camera.service`. `gc2607-service.sh` loads the modules, finds the
+sensor's pipeline by following the media graph (`gc2607-media.sh`) and starts `gc2607_isp`, which reads the raw Bayer
+frames, runs exposure, white balance, demosaic and the display curve, and writes 1920x1080 YUYV to `/dev/video50`
+("GC2607 Camera", v4l2loopback). Apps open that device directly or through PipeWire; the sensor streams only while
+one is reading.
 
-### Quick Start (After Reboot)
+| Task | Command |
+|---|---|
+| First install | `make isp && sudo ./gc2607-setup-service.sh` |
+| Update the ISP | `make isp && sudo ./gc2607-install-isp.sh` (restarts the service, rolls back on failure) |
+| Update the service scripts, unit or loopback options | `sudo ./gc2607-setup-service.sh scripts`, `unit` or `loopback` |
+| Update the driver | `sudo ./gc2607-driver-install.sh` (DKMS, rebuilt on every kernel update) |
+| Check health | `bash gc2607-health.sh`; if the camera is missing, `sudo dmesg \| grep -i gc2607` should show `GC2607 probe successful` |
+| Raw frames for ISP work | `sudo ./gc2607-raw-capture.sh SCENE EXP:GAIN[:VBLANK] ...` (camera on; see its header) |
 
-1. **Initialize the camera** (loads modules and configures everything):
-   ```bash
-   sudo ./init_camera.sh
-   ```
-
-2. **Capture a test image**:
-   ```bash
-   ./quick_capture.sh
-   feh test.png
-   ```
-
-**Current Status**: 
-- ✅ Driver fully functional with exposure/gain controls
-- ✅ No post-processing needed - images are properly exposed natively
-
-### Manual Capture
-```bash
-# 1. Load required modules
-sudo modprobe videodev v4l2-async ipu_bridge intel-ipu6 intel-ipu6-isys
-sudo insmod gc2607.ko
-
-# 2. Configure video format and enable link
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
-
-# 3. Capture raw image and view
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=myimage.raw
-./view_raw_bright.py myimage.raw 1.0
-feh test.png
-```
-
-### Automated Capture Script
-
-For convenience, you can create a script:
-
-```bash
-#!/bin/bash
-# capture.sh - Quick capture script
-
-# Configure and capture
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=capture_$(date +%s).raw
-
-# Convert last captured image
-LATEST=$(ls -t capture_*.raw | head -1)
-./view_raw_bright.py "$LATEST" 5.0
-feh "${LATEST%.raw}.png"
-```
-
-### Using with OBS Studio and Video Applications
-
-The camera outputs raw Bayer format which most applications can't handle directly. Use the virtual RGB camera:
-
-```bash
-# 1. Initialize the camera (only needed once per boot)
-sudo ./init_camera.sh
-
-# 2. Create virtual RGB camera (leave running in background)
-./create_virtual_camera.sh
-```
-
-Now in OBS Studio:
-1. Add Source → Video Capture Device (V4L2)
-2. Select device: **"GC2607 RGB"** from the dropdown
-3. The camera will appear with proper RGB colors and correct orientation
-
-**Note:** The `create_virtual_camera.sh` script must keep running while using the camera.
-
-### Using with Google Meet and Chrome/Chromium
-
-**Important:** Chrome/Chromium's PipeWire camera support blocks v4l2loopback virtual cameras. You need to disable it:
-
-#### One-time Setup for Chrome/Chromium:
-
-1. Open Chrome/Chromium and navigate to: `chrome://flags`
-2. Search for: **"pipewire"**
-3. Find: **"PipeWire Camera support"**
-4. Set to: **Disabled**
-5. Click **"Relaunch"**
-
-#### Using the Camera:
-
-```bash
-# Option 1: Use create_virtual_camera.sh (works for both OBS and Meet)
-./create_virtual_camera.sh
-
-# Option 2: Use reload_for_chrome.sh (optimized for Chrome with I420 format)
-./reload_for_chrome.sh
-```
-
-Then in Google Meet:
-1. Join a meeting
-2. Click Settings (gear icon) → Video
-3. Select: **"GC2607 RGB Camera"** from the dropdown
-
-**Note:** Your external USB cameras (like Logitech) will still work perfectly with PipeWire disabled. Both cameras will appear in the list.
-
-### Adjusting Exposure and Gain
-
-The camera uses a gain LUT (lookup table) with 17 entries (0-16), not raw gain values.
-
-```bash
-# List available controls
-v4l2-ctl -d /dev/v4l-subdev6 --list-ctrls
-
-# Adjust exposure (range: 4-2002)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=2002
-
-# Adjust gain (range: 0-16, LUT index)
-# 0 = 1.0x gain (lowest noise)
-# 4 = 2.0x gain
-# 8 = 4.0x gain
-# 16 = 15.8x gain (max)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl analogue_gain=16
-
-# Optimal defaults for indoor lighting (set automatically by scripts)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=2002,analogue_gain=16
-```
-
-### White Balance
-
-All camera scripts automatically apply **gray world white balance** during Bayer-to-RGB conversion using GStreamer's `frei0r-filter-coloradj-rgb`:
-
-- **Red gain:** 1.034
-- **Green gain:** 1.000 (reference)
-- **Blue gain:** 1.246
-
-These values are calibrated for natural color reproduction. To recalibrate for your lighting conditions:
-
-```bash
-# Capture a test frame
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=wb_test.raw
-
-# Calculate optimal white balance gains
-./calculate_wb_gains.py wb_test.raw
-
-# Use the calculated gains with the WB script
-./create_virtual_camera_wb.sh <R_GAIN> <G_GAIN> <B_GAIN>
-```
-
-## Troubleshooting
-
-### Image is too dark or too bright
-Adjust the exposure and gain controls:
-```bash
-# Increase brightness (max values)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=2002,analogue_gain=16
-
-# Decrease brightness (for bright conditions)
-v4l2-ctl -d /dev/v4l-subdev6 --set-ctrl exposure=1000,analogue_gain=8
-
-# For raw captures, use white balance script:
-./view_raw_wb.py capture.raw 5.0
-
-# Or use brightness multiplier without white balance:
-./view_raw_bright.py capture.raw 8.0  # Try values between 3.0 and 10.0
-```
-
-### Image is all black
-Check if your laptop has a physical camera privacy slider/cover. Many laptops include a hardware privacy mechanism.
-
-### "Link has been severed" error
-The media link isn't enabled. Run:
-```bash
-media-ctl -d /dev/media0 -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]'
-```
-
-### "Format mismatch" error
-Ensure you're using the BA10 pixel format (GRBG Bayer):
-```bash
-v4l2-ctl -d /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=BA10
-```
-
-### Sensor not detected
-1. Check that ipu_bridge recognizes GCTI2607:
-   ```bash
-   sudo dmesg | grep -i "GCTI2607\|gc2607"
-   ```
-2. Verify the modified ipu_bridge is loaded:
-   ```bash
-   modinfo ipu_bridge
-   strings /lib/modules/$(uname -r)/kernel/drivers/media/pci/intel/ipu-bridge.ko.zst | grep GCTI2607
-   ```
-
-### Camera not appearing in Google Meet/Chrome
-
-**Cause:** Chrome's PipeWire camera support blocks v4l2loopback virtual cameras.
-
-**Solution:**
-1. Go to `chrome://flags` in Chrome/Chromium
-2. Search for "pipewire"
-3. Disable "PipeWire Camera support"
-4. Restart the browser
-5. Run `./reload_for_chrome.sh` to restart the camera pipeline
-6. Refresh Google Meet
-
-The camera should now appear as "GC2607 RGB Camera" in the device list.
+Day-to-day operation, kernel updates and recovery: `docs/operations-runbook.md`. The early manual workflow (capture
+scripts, Python RAW viewers, virtual-camera and Chrome scripts, phase test scripts) was removed on 2026-10-18 and is in
+git history (`git log --diff-filter=D --stat -- 'view_raw*.py' 'test_*.sh'`).
 
 ## Architecture
 
@@ -307,14 +120,10 @@ The camera should now appear as "GC2607 RGB Camera" in the device list.
 ### Key Components
 
 - **gc2607.c** - Main driver (V4L2 subdev, power management, register initialization)
-- **ipu-bridge.c** - Modified to recognize GCTI2607 sensor
-- **view_raw_bright.py** - RAW Bayer to PNG converter with brightness boost
-- **view_raw_wb.py** - RAW Bayer to PNG converter with gray world white balance
-- **calculate_wb_gains.py** - Calculate optimal white balance gains from raw capture
-- **create_virtual_camera.sh** - Create virtual RGB camera with white balance (OBS/YUY2)
-- **create_virtual_camera_wb.sh** - Parameterized white balance version
-- **reload_for_chrome.sh** - Create virtual RGB camera for Chrome/Meet (I420, 24fps)
-- **compile_ipu_bridge_simple.sh** - Builds modified ipu_bridge module
+- **ipu-bridge.c** - Modified to recognize GCTI2607 sensor (built by DKMS, `dkms-setup.sh`)
+- **gc2607_isp.c** - Software ISP: exposure control, white balance, demosaic, display curve, YUYV output
+- **gc2607-service.sh**, **gc2607-media.sh** - Service start-up and media-graph discovery
+- **gc2607-setup-service.sh** - Installs the service, its scripts and the v4l2loopback options
 
 ## Technical Details
 
@@ -339,14 +148,12 @@ The camera should now appear as "GC2607 RGB Camera" in the device list.
 - **Reset GPIO:** Provided by INT3472 PMIC
 - **Reset Sequence:** HIGH (20ms) → LOW (20ms) → HIGH (10ms)
 
-## Test Scripts
+## Tests and Tools
 
-- `test_phase4.sh` - Verify V4L2 integration
-- `test_camera_streaming.sh` - Check IPU6 integration
+- `make test` - ISP unit tests (`tests/`: display curve, white balance, output, exposure controller)
+- `make bench` - Per-frame ISP timing
+- `tools/isp_replay.c`, `tools/isp_metrics.py` - Replay raw captures through the ISP and score the output
 - `investigate_ipu_bridge.sh` - Analyze bridge sensor support
-- `QUICK_TEST.sh` - Quick functionality test
-- `view_raw.py` - Basic RAW converter
-- `view_raw_bright.py` - RAW converter with brightness boost
 
 ## Future Enhancements
 
